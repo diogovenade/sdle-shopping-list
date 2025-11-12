@@ -11,4 +11,10 @@ Group members:
 
 ## Architecture
 
-...
+This section discusses the general architectural choices regarding
+the project of a local-first shopping list on the cloud.
+
+### Technologies
+
+- Rust for the client and server side applications.
+- SQLite3 for the database.
