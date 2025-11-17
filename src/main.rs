@@ -1,5 +1,8 @@
 use std::env;
 
+mod server;
+mod client;
+
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
 }
@@ -14,10 +17,16 @@ fn main() {
 
     match run_opt.as_str() {
         "client" => {
-            // run client
+            if let Err(e) = client::client_connect() {
+                eprintln!("Client error: {}", e);
+                std::process::exit(1);
+            }
         }
         "server" => {
-            // run server
+            if let Err(e) = server::setup_server() {
+                eprintln!("Server error: {}", e);
+                std::process::exit(1);
+            }
         }
         _ => {
             print_usage();
