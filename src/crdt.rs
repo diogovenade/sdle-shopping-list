@@ -1,13 +1,156 @@
+use core::cmp::{self, Ordering};
+use core::fmt::{self, Debug, Display};
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use uuid::Uuid;
+
+// ShoppingList
+pub struct ShoppingList {
+    id: Uuid,
+    name: String,
+    // items: could be AWOR-Map<item.name, item>
+}
 
 // Item
 pub struct Item {
-    id: Uuid,
     name: String,
-    amount: u32,
-    acquired: bool,
+    amount: PNCounter,
+    acquired: LWWReg<Uuid>,
+}
+
+// Vector Clock
+#[derive(PartialEq, Eq, Hash)]
+pub struct VClock<A: Ord> {
+    pub dots: BTreeMap<A, u64>,
+}
+
+impl<A: Ord> VClock<A> {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn get(&self, actor: &A) -> u64 {
+        self.dots.get(actor).cloned().unwrap_or(0)
+    }
+
+    pub fn get_tuple(&self, actor: A) -> (A, u64) {
+        let counter = self.get(&actor);
+        (actor, counter)
+    }
+
+    pub fn inc(&mut self, actor: A) -> u64 {
+        let entry = self.dots.entry(actor).or_insert(0);
+        *entry += 1;
+        *entry
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.dots.is_empty()
+    }
+
+    pub fn diverged(&self, other: &VClock<A>) -> bool {
+        self.partial_cmp(other).is_none()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&A, u64)> {
+        self.dots.iter().map(|(a, c)| (a, *c))
+    }
+
+    pub fn common(left: &VClock<A>, right: &VClock<A>) -> VClock<A>
+    where
+        A: Clone,
+    {
+        let mut dots = BTreeMap::new();
+        for (left_actor, left_counter) in left.dots.iter() {
+            let right_counter = right.get(left_actor);
+            if right_counter == *left_counter {
+                dots.insert(left_actor.clone(), *left_counter);
+            }
+        }
+        Self { dots }
+    }
+}
+
+impl<A: Ord + Display> Display for VClock<A> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "<")?;
+        for (i, (actor, count)) in self.dots.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{}:{}", actor, count)?;
+        }
+        write!(f, ">")
+    }
+}
+
+impl<A: Ord> Default for VClock<A> {
+    fn default() -> Self {
+        Self {
+            dots: BTreeMap::new(),
+        }
+    }
+}
+
+impl<A: Ord> PartialOrd for VClock<A> {
+    fn partial_cmp(&self, other: &VClock<A>) -> Option<Ordering> {
+        if self == other {
+            Some(Ordering::Equal)
+        } else if other.dots.iter().all(|(w, c)| self.get(w) >= *c) {
+            Some(Ordering::Greater)
+        } else if self.dots.iter().all(|(w, c)| other.get(w) >= *c) {
+            Some(Ordering::Less)
+        } else {
+            None
+        }
+    }
+}
+
+// LLWReg
+pub struct LWWReg<A> {
+    val: u32,
+    clock: u32, // monotonic value
+    actor: A,   // per actor
+}
+
+impl<A: Ord + Clone> LWWReg<A> {
+    pub fn new(val: u32, clock: u32, actor: A) -> Self {
+        Self { val, clock, actor }
+    }
+
+    fn should_update(&self, clock: u32, actor: &A) -> bool {
+        match clock.cmp(&self.clock) {
+            Ordering::Greater => true,
+            Ordering::Less => false,
+            Ordering::Equal => actor > &self.actor,
+        }
+    }
+
+    pub fn update(&mut self, val: u32, clock: u32, actor: A) {
+        if self.should_update(clock, &actor) {
+            self.val = val;
+            self.clock = clock;
+            self.actor = actor;
+        }
+    }
+
+    pub fn merge(&mut self, other: &Self) {
+        if self.should_update(other.clock, &other.actor) {
+            self.val = other.val;
+            self.clock = other.clock;
+            self.actor = other.actor.clone();
+        }
+    }
+}
+
+impl<A: Ord + Default> Default for LWWReg<A> {
+    fn default() -> Self {
+        Self {
+            val: u32::default(),
+            clock: u32::default(),
+            actor: A::default(),
+        }
+    }
 }
 
 // PNCounter
