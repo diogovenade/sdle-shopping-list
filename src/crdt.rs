@@ -1,7 +1,7 @@
-use core::cmp::{self, Ordering};
-use core::fmt::{self, Debug, Display};
-use std::cmp;
+#![allow(dead_code)]
+use std::cmp::{self, Ordering};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::{self, Display};
 use uuid::Uuid;
 
 // ShoppingList
@@ -12,10 +12,74 @@ pub struct ShoppingList {
 }
 
 // Item
+#[derive(Clone)]
 pub struct Item {
-    name: String,
     amount: PNCounter,
     acquired: LWWReg<Uuid>,
+}
+
+// AWORMap
+pub struct Metadata {
+    pub is_deleted: bool,
+    pub clock: VClock<Uuid>,
+    pub item: Item,
+}
+
+impl Metadata {
+    pub fn new(item: Item, clock: VClock<Uuid>) -> Self {
+        Self {
+            is_deleted: false,
+            clock,
+            item,
+        }
+    }
+}
+
+pub struct AWORMap {
+    entries: HashMap<String, Metadata>,
+    actor: Uuid,
+}
+
+impl AWORMap {
+    pub fn new(actor: Uuid) -> Self {
+        Self {
+            entries: HashMap::new(),
+            actor,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|(_, m)| !m.is_deleted)
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
+    pub fn values(&self) -> Vec<Item> {
+        self.entries
+            .values()
+            .filter(|m| !m.is_deleted)
+            .map(|m| m.item.clone())
+            .collect()
+    }
+
+    pub fn get_item_ref(&self, name: &String) -> Option<&Item> {
+        if let Some(metadata) = self.entries.get(name) {
+            if !metadata.is_deleted {
+                return Some(&metadata.item);
+            }
+        }
+        None
+    }
+
+    pub fn reset(&mut self) {
+        todo!();
+    }
 }
 
 // Vector Clock
@@ -107,6 +171,7 @@ impl<A: Ord> PartialOrd for VClock<A> {
 }
 
 // LLWReg
+#[derive(Clone)]
 pub struct LWWReg<A> {
     val: u32,
     clock: u32, // monotonic value
@@ -154,6 +219,7 @@ impl<A: Ord + Default> Default for LWWReg<A> {
 }
 
 // PNCounter
+#[derive(Clone)]
 pub struct PNCounter {
     p: GCounter,
     n: GCounter,
@@ -175,12 +241,12 @@ impl PNCounter {
         self.n.inc();
     }
 
-    pub fn value_local(&self) -> u64 {
-        self.p.value_local() - self.n.value_local()
+    pub fn value_local(&self) -> i64 {
+        self.p.value_local() as i64 - self.n.value_local() as i64
     }
 
-    pub fn value_total(&self) -> u64 {
-        self.p.value_total() - self.n.value_total()
+    pub fn value_total(&self) -> i64 {
+        self.p.value_total() as i64 - self.n.value_total() as i64
     }
 
     pub fn merge(&mut self, other: &PNCounter) {
@@ -191,7 +257,7 @@ impl PNCounter {
 
 // GCounter
 #[derive(Clone)]
-pub struct GCounter {
+struct GCounter {
     counter: HashMap<Uuid, u64>,
     id: Uuid,
 }
@@ -219,7 +285,7 @@ impl GCounter {
     pub fn merge(&mut self, other: &GCounter) {
         for (id, count) in &other.counter {
             let max_count = *cmp::max(count, self.counter.get(id).unwrap_or(&0));
-            self.counter.insert(id.to_owned(), max_count);
+            self.counter.insert(*id, max_count);
         }
     }
 }
