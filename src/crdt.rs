@@ -4,6 +4,10 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Display};
 use uuid::Uuid;
 
+pub trait Mergeable<V> {
+    fn merge(&mut self, other: &V);
+}
+
 // ShoppingList
 pub struct ShoppingList {
     id: Uuid,
@@ -16,6 +20,13 @@ pub struct ShoppingList {
 pub struct Item {
     amount: PNCounter,
     acquired: LWWReg<Uuid>,
+}
+
+impl Mergeable<Item> for Item {
+    fn merge(&mut self, other: &Item) {
+        self.amount.merge(&other.amount);
+        self.acquired.merge(&other.acquired);
+    }
 }
 
 // AWORMap
@@ -77,24 +88,56 @@ impl AWORMap {
         None
     }
 
-    pub fn reset(&mut self) {
-        todo!();
+    pub fn insert(&mut self, name: String, item: Item) {
+        let mut clock = self
+            .entries
+            .get(&name)
+            .map(|meta| meta.clock.clone())
+            .unwrap_or_default();
+
+        let _ = clock.inc(self.actor);
+
+        let entry = self
+            .entries
+            .entry(name.clone())
+            .or_insert_with(|| Metadata::new(item.clone(), clock.clone()));
+
+        match clock.partial_cmp(&entry.clock) {
+            Some(Ordering::Greater) => {
+                entry.item = item;
+                entry.clock = clock;
+                entry.is_deleted = false;
+            }
+            None => {
+                entry.item.merge(&item);
+                entry.clock.merge(&clock);
+                entry.is_deleted = false;
+            }
+            _ => (),
+        }
+    }
+
+    pub fn remove(&mut self, name: &String) {
+        if let Some(metadata) = self.entries.get_mut(name) {
+            metadata.clock.inc(self.actor);
+            metadata.is_deleted = true;
+        }
     }
 }
 
 // Vector Clock
-#[derive(PartialEq, Eq, Hash)]
-pub struct VClock<A: Ord> {
+#[derive(PartialEq, Eq, Hash, Clone)]
+pub struct VClock<A: Ord + Copy> {
     pub dots: BTreeMap<A, u64>,
 }
 
-impl<A: Ord> VClock<A> {
+impl<A: Ord + Copy> VClock<A> {
     pub fn new() -> Self {
         Default::default()
     }
 
     pub fn get(&self, actor: &A) -> u64 {
-        self.dots.get(actor).cloned().unwrap_or(0)
+        *self.dots.get(actor).unwrap_or(&0)
     }
 
     pub fn get_tuple(&self, actor: A) -> (A, u64) {
@@ -120,22 +163,30 @@ impl<A: Ord> VClock<A> {
         self.dots.iter().map(|(a, c)| (a, *c))
     }
 
-    pub fn common(left: &VClock<A>, right: &VClock<A>) -> VClock<A>
-    where
-        A: Clone,
-    {
+    pub fn common(left: &VClock<A>, right: &VClock<A>) -> VClock<A> {
         let mut dots = BTreeMap::new();
         for (left_actor, left_counter) in left.dots.iter() {
             let right_counter = right.get(left_actor);
             if right_counter == *left_counter {
-                dots.insert(left_actor.clone(), *left_counter);
+                dots.insert(*left_actor, *left_counter);
             }
         }
         Self { dots }
     }
 }
 
-impl<A: Ord + Display> Display for VClock<A> {
+impl<A: Ord + Copy> Mergeable<VClock<A>> for VClock<A> {
+    fn merge(&mut self, other: &VClock<A>) {
+        for (a, c) in other.dots.iter() {
+            let entry = self.dots.entry(*a).or_insert(0);
+            if *entry < *c {
+                *entry = *c;
+            }
+        }
+    }
+}
+
+impl<A: Ord + Display + Copy> Display for VClock<A> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "<")?;
         for (i, (actor, count)) in self.dots.iter().enumerate() {
@@ -148,7 +199,7 @@ impl<A: Ord + Display> Display for VClock<A> {
     }
 }
 
-impl<A: Ord> Default for VClock<A> {
+impl<A: Ord + Copy> Default for VClock<A> {
     fn default() -> Self {
         Self {
             dots: BTreeMap::new(),
@@ -156,7 +207,7 @@ impl<A: Ord> Default for VClock<A> {
     }
 }
 
-impl<A: Ord> PartialOrd for VClock<A> {
+impl<A: Ord + Copy> PartialOrd for VClock<A> {
     fn partial_cmp(&self, other: &VClock<A>) -> Option<Ordering> {
         if self == other {
             Some(Ordering::Equal)
@@ -178,7 +229,7 @@ pub struct LWWReg<A> {
     actor: A,   // per actor
 }
 
-impl<A: Ord + Clone> LWWReg<A> {
+impl<A: Ord + Copy> LWWReg<A> {
     pub fn new(val: u32, clock: u32, actor: A) -> Self {
         Self { val, clock, actor }
     }
@@ -198,12 +249,14 @@ impl<A: Ord + Clone> LWWReg<A> {
             self.actor = actor;
         }
     }
+}
 
-    pub fn merge(&mut self, other: &Self) {
+impl<A: Ord + Copy> Mergeable<LWWReg<A>> for LWWReg<A> {
+    fn merge(&mut self, other: &LWWReg<A>) {
         if self.should_update(other.clock, &other.actor) {
             self.val = other.val;
             self.clock = other.clock;
-            self.actor = other.actor.clone();
+            self.actor = other.actor;
         }
     }
 }
@@ -248,8 +301,10 @@ impl PNCounter {
     pub fn value_total(&self) -> i64 {
         self.p.value_total() as i64 - self.n.value_total() as i64
     }
+}
 
-    pub fn merge(&mut self, other: &PNCounter) {
+impl Mergeable<PNCounter> for PNCounter {
+    fn merge(&mut self, other: &PNCounter) {
         self.p.merge(&other.p);
         self.n.merge(&other.n);
     }
@@ -281,8 +336,10 @@ impl GCounter {
     pub fn value_total(&self) -> u64 {
         self.counter.values().sum()
     }
+}
 
-    pub fn merge(&mut self, other: &GCounter) {
+impl Mergeable<GCounter> for GCounter {
+    fn merge(&mut self, other: &GCounter) {
         for (id, count) in &other.counter {
             let max_count = *cmp::max(count, self.counter.get(id).unwrap_or(&0));
             self.counter.insert(*id, max_count);
