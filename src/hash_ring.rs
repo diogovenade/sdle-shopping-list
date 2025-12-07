@@ -59,10 +59,103 @@ impl HashRing {
         preference_list
     }
 
+    pub fn get_coordinator(&self, list_id: &Uuid) -> Option<Uuid> {
+        self.get_preference_list(list_id).first().copied()
+    }
+
+    pub fn get_all_servers(&self) -> HashSet<Uuid> {
+        self.ring.values().copied().collect()
+    }
+
+    pub fn server_count(&self) -> usize {
+        self.get_all_servers().len()
+    }
+
     fn hash(&self, key: &str) -> u128 {
         let mut hasher = Md5::new();
         hasher.update(key.as_bytes());
         let result = hasher.finalize();
         u128::from_be_bytes(result.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_preference_list_returns_n_servers() {
+        let mut ring = HashRing::new(3, 3);
+        
+        let node1 = Uuid::new_v4();
+        let node2 = Uuid::new_v4();
+        let node3 = Uuid::new_v4();
+        let node4 = Uuid::new_v4();
+
+        ring.add_node(node1);
+        ring.add_node(node2);
+        ring.add_node(node3);
+        ring.add_node(node4);
+
+        let list_id = Uuid::new_v4();
+        let preference_list = ring.get_preference_list(&list_id);
+
+        assert_eq!(preference_list.len(), 3);
+
+        let unique: HashSet<_> = preference_list.iter().collect();
+        assert_eq!(unique.len(), 3);
+    }
+
+    #[test]
+    fn test_coordinator_is_first_in_preference_list() {
+        let mut ring = HashRing::new(5, 3);
+        
+        let node1 = Uuid::new_v4();
+        let node2 = Uuid::new_v4();
+        
+        ring.add_node(node1);
+        ring.add_node(node2);
+
+        let list_id = Uuid::new_v4();
+        let coordinator = ring.get_coordinator(&list_id);
+        let preference_list = ring.get_preference_list(&list_id);
+
+        assert_eq!(coordinator, preference_list.first().copied());
+    }
+
+    #[test]
+    fn test_remove_server() {
+        let mut ring = HashRing::new(3, 2);
+        
+        let node1 = Uuid::new_v4();
+        let node2 = Uuid::new_v4();
+        
+        ring.add_node(node1);
+        ring.add_node(node2);
+        
+        assert_eq!(ring.server_count(), 2);
+        
+        ring.remove_node(node1);
+        
+        assert_eq!(ring.server_count(), 1);
+        assert!(ring.get_all_servers().contains(&node2));
+        assert!(!ring.get_all_servers().contains(&node1));
+    }
+
+    #[test]
+    fn test_handles_fewer_servers_than_replication_factor() {
+        let mut ring = HashRing::new(3, 5);
+        
+        let node1 = Uuid::new_v4();
+        let node2 = Uuid::new_v4();
+        
+        ring.add_node(node1);
+        ring.add_node(node2);
+
+        let list_id = Uuid::new_v4();
+        let preference_list = ring.get_preference_list(&list_id);
+
+        // Should return only 2 servers, despite replication factor of 5
+        assert_eq!(preference_list.len(), 2);
     }
 }
