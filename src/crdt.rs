@@ -11,8 +11,7 @@ pub trait Mergeable<V> {
 // ShoppingList
 pub struct ShoppingList {
     id: Uuid,
-    name: String,
-    // items: could be AWOR-Map<item.name, item>
+    list: AWORMap,
 }
 
 // Item
@@ -30,6 +29,7 @@ impl Mergeable<Item> for Item {
 }
 
 // AWORMap
+#[derive(Clone)]
 pub struct AWORMap {
     items: HashMap<String, Item>,
 }
@@ -64,6 +64,22 @@ impl AWORMap {
     }
 }
 
+impl Mergeable<AWORMap> for AWORMap {
+    fn merge(&mut self, other: &AWORMap) {
+        for (key, other_item) in &other.items {
+            match self.items.get_mut(key) {
+                Some(self_item) => {
+                    self_item.merge(other_item);
+                }
+                None => {
+                    self.items.insert(key.clone(), other_item.clone());
+                }
+            }
+        }
+    }
+}
+
+/*
 // DeltaAWORMap Metadata
 pub struct Metadata {
     pub clock: VClock<Uuid>,
@@ -76,7 +92,7 @@ impl Metadata {
     }
 }
 
-/*
+
 // DeltaAWORMap
 pub struct DeltaAWORMap {
     entries: HashMap<String, Metadata>,
@@ -157,7 +173,7 @@ impl DeltaAWORMap {
         }
     }
 }
-*/
+
 
 // Vector Clock
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -254,6 +270,8 @@ impl<A: Ord + Copy> PartialOrd for VClock<A> {
         }
     }
 }
+
+*/
 
 // LLWReg
 #[derive(Clone)]
@@ -385,6 +403,26 @@ impl Mergeable<GCounter> for GCounter {
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    fn mk_item(amount: i64, clock: u32, actor: Uuid, acquired: bool) -> Item {
+        let mut pn = PNCounter::new(actor);
+        if amount > 0 {
+            for _ in 0..amount {
+                pn.inc();
+            }
+        } else {
+            for _ in 0..(-amount) {
+                pn.inc();
+            }
+        }
+
+        let reg = LWWReg::new(acquired as u32, clock, actor);
+
+        Item {
+            amount: pn,
+            acquired: reg,
+        }
+    }
 
     // GCounter
     #[test]
@@ -674,5 +712,195 @@ mod tests {
         assert_eq!(ab_c.val, a_bc.val);
         assert_eq!(ab_c.clock, a_bc.clock);
         assert_eq!(ab_c.actor, a_bc.actor);
+    }
+
+    // AWORMap
+    #[test]
+    fn test_awormap_insert_item() {
+        let mut map = AWORMap::new();
+        let id = Uuid::new_v4();
+
+        let item = mk_item(3, 1, id, false);
+        map.insert("apple".into(), item.clone());
+
+        assert!(!map.is_empty());
+        assert_eq!(map.keys(), vec!["apple".to_string()]);
+        assert_eq!(
+            map.values()[0].amount.value_local(),
+            item.amount.value_local()
+        );
+    }
+
+    #[test]
+    fn test_awormap_insert_item_merges() {
+        let mut map = AWORMap::new();
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        let a = mk_item(2, 1, id1, false);
+        let b = mk_item(5, 3, id2, false);
+
+        map.insert("apple".into(), a.clone());
+        map.insert("apple".into(), b.clone());
+
+        let result = map.values()[0].clone();
+
+        assert_eq!(
+            result.amount.value_total(),
+            a.amount.value_local() + b.amount.value_local()
+        );
+    }
+
+    #[test]
+    fn test_awormap_merge_combines_keys() {
+        let mut m1 = AWORMap::new();
+        let mut m2 = AWORMap::new();
+
+        let id = Uuid::new_v4();
+
+        m1.insert("apple".into(), mk_item(3, 1, id, false));
+        m2.insert("banana".into(), mk_item(7, 1, id, false));
+
+        m1.merge(&m2);
+
+        let keys = m1.keys();
+        assert!(keys.contains(&"apple".to_string()));
+        assert!(keys.contains(&"banana".to_string()));
+    }
+
+    #[test]
+    fn test_awormap_acquired() {
+        let mut m1 = AWORMap::new();
+        let mut m2 = AWORMap::new();
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+
+        m1.insert("apple".into(), mk_item(2, 2, id1, false));
+        m2.insert("apple".into(), mk_item(2, 1, id2, true));
+
+        m1.merge(&m2);
+
+        let result = m1.items.get("apple").unwrap();
+
+        assert_eq!(result.acquired.val, 0u32);
+    }
+
+    #[test]
+    fn test_awormap_merge_idempotent() {
+        let mut m1 = AWORMap::new();
+
+        let id = Uuid::new_v4();
+        m1.insert("apple".into(), mk_item(1, 1, id, false));
+
+        let clone = m1.clone();
+        m1.merge(&clone);
+
+        assert_eq!(m1.keys(), clone.keys());
+        assert_eq!(
+            m1.items["apple"].amount.value_local(),
+            clone.items["apple"].amount.value_local()
+        );
+        assert_eq!(
+            m1.items["apple"].acquired.val,
+            clone.items["apple"].acquired.val
+        );
+    }
+
+    #[test]
+    fn test_awormap_merge_is_commutative() {
+        let id1 = Uuid::nil();
+        let id2 = Uuid::from_u128(2);
+
+        let mut a = AWORMap::new();
+        let mut b = AWORMap::new();
+
+        a.insert("apple".into(), mk_item(3, 2, id1, false));
+        b.insert("apple".into(), mk_item(5, 4, id2, false));
+        b.insert("banana".into(), mk_item(1, 1, id1, false));
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+
+        let mut ba = b.clone();
+        ba.merge(&a);
+
+        assert_eq!(ab.keys().len(), ba.keys().len());
+        assert_eq!(
+            ab.items["apple"].amount.value_total(),
+            ba.items["apple"].amount.value_total()
+        );
+        assert_eq!(
+            ab.items["apple"].acquired.clock,
+            ba.items["apple"].acquired.clock
+        );
+        assert_eq!(
+            ab.items["banana"].amount.value_total(),
+            ba.items["banana"].amount.value_total()
+        );
+    }
+
+    #[test]
+    fn test_awormap_merge_is_associative() {
+        let id1 = Uuid::nil();
+        let id2 = Uuid::from_u128(2);
+        let id3 = Uuid::from_u128(3);
+
+        let mut a = AWORMap::new();
+        let mut b = AWORMap::new();
+        let mut c = AWORMap::new();
+
+        a.insert("apple".into(), mk_item(1, 1, id1, false));
+        b.insert("apple".into(), mk_item(2, 2, id2, false));
+        c.insert("banana".into(), mk_item(3, 3, id3, false));
+
+        let mut ab_c = a.clone();
+        ab_c.merge(&b);
+        ab_c.merge(&c);
+
+        let mut a_bc = a.clone();
+        let mut bc = b.clone();
+        bc.merge(&c);
+        a_bc.merge(&bc);
+
+        assert_eq!(ab_c.keys().len(), a_bc.keys().len());
+
+        for key in ab_c.keys() {
+            let i1 = ab_c.items.get(&key).unwrap();
+            let i2 = a_bc.items.get(&key).unwrap();
+
+            assert_eq!(i1.amount.value_total(), i2.amount.value_total());
+            assert_eq!(i1.acquired.clock, i2.acquired.clock);
+            assert_eq!(i1.acquired.actor, i2.acquired.actor);
+        }
+    }
+
+    #[test]
+    fn test_awormap_replicas_converge_after_merge() {
+        let id1 = Uuid::nil();
+        let id2 = Uuid::from_u128(2);
+
+        let mut r1 = AWORMap::new();
+        let mut r2 = AWORMap::new();
+
+        r1.insert("apple".into(), mk_item(2, 1, id1, false));
+        r2.insert("apple".into(), mk_item(5, 3, id2, false));
+        r2.insert("banana".into(), mk_item(1, 1, id1, false));
+
+        let mut m1 = r1.clone();
+        let mut m2 = r2.clone();
+
+        m1.merge(&r2);
+        m2.merge(&r1);
+
+        assert_eq!(m1.keys(), m2.keys());
+
+        for key in m1.keys() {
+            let i1 = m1.items.get(&key).unwrap();
+            let i2 = m2.items.get(&key).unwrap();
+
+            assert_eq!(i1.amount.value_total(), i2.amount.value_total());
+            assert_eq!(i1.acquired.clock, i2.acquired.clock);
+        }
     }
 }
