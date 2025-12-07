@@ -30,28 +30,60 @@ impl Mergeable<Item> for Item {
 }
 
 // AWORMap
+pub struct AWORMap {
+    items: HashMap<String, Item>,
+}
+
+impl AWORMap {
+    pub fn new() -> Self {
+        Self {
+            items: HashMap::new(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    pub fn keys(&self) -> Vec<String> {
+        // WARNING: not currently filtering for deleted items
+        self.items.iter().map(|(k, _)| k.clone()).collect()
+    }
+
+    pub fn values(&self) -> Vec<Item> {
+        // WARNING: not currently filtering for deleted items
+        self.items.values().map(|v| v.clone()).collect()
+    }
+
+    pub fn insert(&mut self, name: String, item: Item) {
+        if self.items.contains_key(&name) {
+            self.items.get_mut(&name).unwrap().merge(&item);
+        } else {
+            self.items.insert(name, item);
+        }
+    }
+}
+
+// DeltaAWORMap Metadata
 pub struct Metadata {
-    pub is_deleted: bool,
     pub clock: VClock<Uuid>,
     pub item: Item,
 }
 
 impl Metadata {
     pub fn new(item: Item, clock: VClock<Uuid>) -> Self {
-        Self {
-            is_deleted: false,
-            clock,
-            item,
-        }
+        Self { clock, item }
     }
 }
 
-pub struct AWORMap {
+/*
+// DeltaAWORMap
+pub struct DeltaAWORMap {
     entries: HashMap<String, Metadata>,
     actor: Uuid,
 }
 
-impl AWORMap {
+impl DeltaAWORMap {
     pub fn new(actor: Uuid) -> Self {
         Self {
             entries: HashMap::new(),
@@ -113,7 +145,8 @@ impl AWORMap {
                 entry.clock.merge(&clock);
                 entry.is_deleted = false;
             }
-            _ => (),
+            _ => (), //TODO: investigate this scenario
+                     //se for igual desempate pelo Uuid
         }
     }
 
@@ -124,6 +157,7 @@ impl AWORMap {
         }
     }
 }
+*/
 
 // Vector Clock
 #[derive(PartialEq, Eq, Hash, Clone)]
@@ -539,5 +573,106 @@ mod tests {
         }
 
         assert_eq!(c.value_local(), 2);
+    }
+
+    // LWWReg
+    #[test]
+    fn test_lwwreg_update_newer_clock() {
+        let mut reg = LWWReg::new(10, 1, 1u32);
+        reg.update(20, 2, 2);
+
+        assert_eq!(reg.val, 20);
+        assert_eq!(reg.clock, 2);
+        assert_eq!(reg.actor, 2);
+    }
+
+    #[test]
+    fn test_lwwreg_update_ignores_older_clock() {
+        let mut reg = LWWReg::new(10, 2, 1u32);
+        reg.update(20, 1, 2);
+
+        assert_eq!(reg.val, 10);
+        assert_eq!(reg.clock, 2);
+        assert_eq!(reg.actor, 1);
+    }
+
+    #[test]
+    fn test_lwwreg_update_tiebreaker() {
+        let mut reg = LWWReg::new(10, 5, 1u32);
+        reg.update(20, 5, 2);
+
+        assert_eq!(reg.val, 20);
+        assert_eq!(reg.actor, 2);
+    }
+
+    #[test]
+    fn test_lwwreg_merge() {
+        let mut a = LWWReg::new(1, 1, 1u32);
+        let b = LWWReg::new(2, 3, 2u32);
+
+        a.merge(&b);
+
+        assert_eq!(a.val, 2);
+        assert_eq!(a.clock, 3);
+        assert_eq!(a.actor, 2);
+    }
+
+    #[test]
+    fn test_lwwreg_merge_tiebreaker() {
+        let mut a = LWWReg::new(10, 7, 1u32);
+        let b = LWWReg::new(20, 7, 2u32);
+
+        a.merge(&b);
+
+        assert_eq!(a.val, 20);
+        assert_eq!(a.actor, 2);
+    }
+
+    #[test]
+    fn test_lwwreg_merge_is_idempotent() {
+        let mut a = LWWReg::new(10, 5, 3u32);
+        let clone = a.clone();
+
+        a.merge(&clone);
+
+        assert_eq!(a.val, clone.val);
+        assert_eq!(a.clock, clone.clock);
+        assert_eq!(a.actor, clone.actor);
+    }
+
+    #[test]
+    fn test_lwwreg_merge_is_commutative() {
+        let a = LWWReg::new(10, 5, 1u32);
+        let b = LWWReg::new(20, 7, 2u32);
+
+        let mut ab = a.clone();
+        ab.merge(&b);
+
+        let mut ba = b.clone();
+        ba.merge(&a);
+
+        assert_eq!(ab.val, ba.val);
+        assert_eq!(ab.clock, ba.clock);
+        assert_eq!(ab.actor, ba.actor);
+    }
+
+    #[test]
+    fn test_lwwreg_merge_is_associative() {
+        let a = LWWReg::new(10, 1, 1u32);
+        let b = LWWReg::new(20, 2, 2u32);
+        let c = LWWReg::new(30, 3, 3u32);
+
+        let mut ab_c = a.clone();
+        ab_c.merge(&b);
+        ab_c.merge(&c);
+
+        let mut a_bc = a.clone();
+        let mut bc = b.clone();
+        bc.merge(&c);
+        a_bc.merge(&bc);
+
+        assert_eq!(ab_c.val, a_bc.val);
+        assert_eq!(ab_c.clock, a_bc.clock);
+        assert_eq!(ab_c.actor, a_bc.actor);
     }
 }
