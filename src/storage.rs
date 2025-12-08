@@ -7,16 +7,83 @@ use uuid::Uuid;
 
 pub trait Stored {
     fn from_schema() -> Self;
-    fn insert(&self, conn: &Connection) -> Result<()>;
+    fn insert(&self, conn: &Connection, client_id: Uuid) -> Result<()>;
 }
 
-impl Stored for Item {
+impl Stored for ShoppingList {
     fn from_schema() -> Self {
         todo!();
     }
 
-    fn insert(&self, conn: &Connection) -> Result<()> {
-        todo!();
+    fn insert(&self, conn: &Connection, client_id: Uuid) -> Result<()> {
+        let shopping_list_id = self.id.to_string();
+        let map = &self.list; 
+
+        let tx = conn.unchecked_transaction()?;
+
+        for (name, item) in &map.items {
+            // Insert positive gcounter 
+            let p_id = {
+                tx.execute(
+                    "INSERT INTO gcounter (owner_actor) VALUES (?1)",
+                    (&client_id.to_string(),),
+                )?;
+
+                tx.last_insert_rowid()
+            };
+            
+            // Insert negative gcounter
+            let n_id = {
+                tx.execute(
+                    "INSERT INTO gcounter (owner_actor) VALUES (?1)",
+                    (&client_id.to_string(),),
+                )?;
+
+                tx.last_insert_rowid()
+            };
+
+            // Insert positive counter actor counts 
+            for (actor, count) in &item.amount.p.counter {
+                tx.execute(
+                    "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)",
+                    (&p_id, &actor.to_string(), count),
+                )?;
+            }
+
+            // Insert negative counter actor counts 
+            for (actor, count) in &item.amount.n.counter {
+                tx.execute(
+                    "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)", 
+                    (&n_id, &actor.to_string(), count),
+                )?;
+            }
+
+            // Insert item 
+            tx.execute(
+                "INSERT INTO awormap_items (
+                    shopping_list_id,
+                    item_name,
+                    acquired_val,
+                    acquired_clock,
+                    acquired_actor,
+                    p_gcounter_id,
+                    n_gcounter_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                (
+                    &shopping_list_id,
+                    name,
+                    &item.acquired.val,
+                    &item.acquired.clock,
+                    item.acquired.actor.to_string(),
+                    &p_id,
+                    &n_id,
+                ),
+            )?;
+        }
+
+        tx.commit()?;
+
+        Ok(())
     }
 }
 
@@ -87,7 +154,7 @@ impl ClientStorage {
                     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shopping_list_id TEXT NOT NULL,
                     item_name TEXT NOT NULL,
-                    acquired_val INTEGER NOT NULL,
+                    acquired_val BOOLEAN NOT NULL,
                     acquired_clock INTEGER NOT NULL,
                     acquired_actor TEXT NOT NULL,
                     p_gcounter_id INTEGER NOT NULL,

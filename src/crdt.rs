@@ -10,15 +10,15 @@ pub trait Mergeable<V> {
 
 // ShoppingList
 pub struct ShoppingList {
-    id: Uuid,
-    list: AWORMap,
+    pub id: Uuid,
+    pub list: AWORMap,
 }
 
 // Item
 #[derive(Clone)]
 pub struct Item {
-    amount: PNCounter,
-    acquired: LWWReg<Uuid>,
+    pub amount: PNCounter,
+    pub acquired: LWWReg<Uuid>, //TODO:weak causality, consider swapping for MVReg
 }
 
 impl Mergeable<Item> for Item {
@@ -31,7 +31,7 @@ impl Mergeable<Item> for Item {
 // AWORMap
 #[derive(Clone)]
 pub struct AWORMap {
-    items: HashMap<String, Item>,
+    pub items: HashMap<String, Item>,
 }
 
 impl AWORMap {
@@ -276,9 +276,9 @@ impl<A: Ord + Copy> PartialOrd for VClock<A> {
 // LLWReg
 #[derive(Clone)]
 pub struct LWWReg<A> {
-    val: u32,
-    clock: u32, // monotonic value
-    actor: A,   // per actor
+    pub val: u32,
+    pub clock: u32, // monotonic value
+    pub actor: A,   // per actor
 }
 
 impl<A: Ord + Copy> LWWReg<A> {
@@ -326,8 +326,8 @@ impl<A: Ord + Default> Default for LWWReg<A> {
 // PNCounter
 #[derive(Clone)]
 pub struct PNCounter {
-    p: GCounter,
-    n: GCounter,
+    pub p: GCounter,
+    pub n: GCounter,
 }
 
 impl PNCounter {
@@ -364,9 +364,9 @@ impl Mergeable<PNCounter> for PNCounter {
 
 // GCounter
 #[derive(Clone)]
-struct GCounter {
-    counter: HashMap<Uuid, u64>,
-    id: Uuid,
+pub struct GCounter {
+    pub counter: HashMap<Uuid, u64>,
+    pub id: Uuid,
 }
 
 impl GCounter {
