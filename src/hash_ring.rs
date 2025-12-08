@@ -1,11 +1,11 @@
+use md5::{Digest, Md5};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
-use md5::{Md5, Digest};
 
 pub struct HashRing {
     ring: BTreeMap<u128, Uuid>, // hash -> server_id
-    virtual_nodes: usize, // partitioning
-    replicas: usize, // replication
+    virtual_nodes: usize,       // partitioning
+    replicas: usize,            // replication
 }
 
 impl HashRing {
@@ -86,7 +86,7 @@ mod tests {
     #[test]
     fn test_preference_list_returns_n_servers() {
         let mut ring = HashRing::new(3, 3);
-        
+
         let node1 = Uuid::new_v4();
         let node2 = Uuid::new_v4();
         let node3 = Uuid::new_v4();
@@ -109,10 +109,10 @@ mod tests {
     #[test]
     fn test_coordinator_is_first_in_preference_list() {
         let mut ring = HashRing::new(5, 3);
-        
+
         let node1 = Uuid::new_v4();
         let node2 = Uuid::new_v4();
-        
+
         ring.add_node(node1);
         ring.add_node(node2);
 
@@ -126,17 +126,17 @@ mod tests {
     #[test]
     fn test_remove_server() {
         let mut ring = HashRing::new(3, 2);
-        
+
         let node1 = Uuid::new_v4();
         let node2 = Uuid::new_v4();
-        
+
         ring.add_node(node1);
         ring.add_node(node2);
-        
+
         assert_eq!(ring.server_count(), 2);
-        
+
         ring.remove_node(node1);
-        
+
         assert_eq!(ring.server_count(), 1);
         assert!(ring.get_all_servers().contains(&node2));
         assert!(!ring.get_all_servers().contains(&node1));
@@ -145,17 +145,16 @@ mod tests {
     #[test]
     fn test_handles_fewer_servers_than_replication_factor() {
         let mut ring = HashRing::new(3, 5);
-        
+
         let node1 = Uuid::new_v4();
         let node2 = Uuid::new_v4();
-        
+
         ring.add_node(node1);
         ring.add_node(node2);
 
         let list_id = Uuid::new_v4();
         let preference_list = ring.get_preference_list(&list_id);
 
-        // Should return only 2 servers, despite replication factor of 5
         assert_eq!(preference_list.len(), 2);
     }
 }

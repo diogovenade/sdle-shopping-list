@@ -1,5 +1,6 @@
-mod crdt;
-mod server;
 mod client;
-mod message;
+mod crdt;
 mod hash_ring;
+mod message;
+mod server;
+mod storage;

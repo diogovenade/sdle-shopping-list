@@ -1,5 +1,9 @@
+use uuid::Uuid;
 use zmq::{Context, Error, SocketType};
 
+struct Client {
+    id: Uuid,
+}
 pub fn client_connect() -> Result<(), Error> {
     println!("Connecting to server...");
     let context = Context::new();
@@ -14,7 +18,7 @@ pub fn client_connect() -> Result<(), Error> {
         println!("Received: {}", message.as_str().unwrap_or("Invalid UTF-8"));
     }
 
-    // drop(requester); // rust handles this automatically 
+    // drop(requester); // rust handles this automatically
     // Context::destroy(&mut context); // this too
 
     Ok(())
