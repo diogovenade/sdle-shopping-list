@@ -30,59 +30,60 @@ pub enum DbError {
 
 struct ClientStorage {
     client_id: Uuid,
-    lists: Vec<ShoppingList>,
+    db_path: PathBuf,
+    db_conn: Connection,
+    cached_lists: Vec<ShoppingList>,
 }
 
 impl ClientStorage {
-    //TODO: change storage directory
-    fn get_db_path(&self) -> std::io::Result<PathBuf> {
-        let mut path = dirs::config_dir().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "No user config directory found.",
-            )
-        })?;
-        path.push("sdlestorage");
+    pub fn new(client_id: Uuid) -> Result<Self, DbError> {
+        let db_path = Self::compute_db_path()?;
+        println!("Computed db_path successfully.");
+        let db_conn = Connection::open(&db_path)?;
+        println!("Database connection established successfully.");
+        
+        db_conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        db_conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        println!("Pragmas executed successfully.");
 
-        std::fs::create_dir_all(&path)?;
+        Self::initialize_schema(&db_conn)?;
+        println!("Schema initialized successfully.");
 
-        path.push("client.db");
-        Ok(path)
+        Ok(ClientStorage {
+            client_id,
+            db_path,
+            db_conn,
+            cached_lists: Vec::new(),
+        })
     }
 
-    fn setup_db(&self) -> sqlResult<Connection, DbError> {
-        let db_path = self.get_db_path()?;
-
-        let conn = Connection::open(db_path)?;
-
-        self.initialize_schema(&conn)?;
-
-        Ok(conn)
+    fn compute_db_path() -> std::io::Result<PathBuf> {
+        let mut root = std::env::current_dir()?; // appropriate directory for dev,
+                                                               // i.e. cargo run, cargo test, etc.
+        root.push("data");
+        root.push("clientstorage");
+        std::fs::create_dir_all(&root)?;
+        root.push("client.db");
+        Ok(root)
     }
 
-    fn initialize_schema(&self, conn: &Connection) -> Result<(), DbError> {
-        conn.execute_batch(
+    fn initialize_schema(db_conn: &Connection) -> Result<(), DbError> {
+        db_conn.execute_batch(
             r#"
-                CREATE TABLE gcounter (
+                CREATE TABLE IF NOT EXISTS gcounter (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     owner_actor TEXT NOT NULL
                 );
-            "#,
-        )?;
-        conn.execute_batch(
-            r#"
-                CREATE TABLE gcounter_actor_values (
+
+                CREATE TABLE IF NOT EXISTS gcounter_actor_values (
                     gcounter_id INTEGER NOT NULL,
                     actor_id TEXT NOT NULL,
                     value INTEGER NOT NULL,
                     PRIMARY KEY (gcounter_id, actor_id),
                     FOREIGN KEY (gcounter_id) REFERENCES gcounter(id)
                 );
-            "#,
-        )?;
-        conn.execute_batch(
-            r#"
-                CREATE TABLE awormap_items (
+
+                CREATE TABLE IF NOT EXISTS awormap_items (
                     item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     shopping_list_id TEXT NOT NULL,
                     item_name TEXT NOT NULL,
@@ -98,5 +99,25 @@ impl ClientStorage {
             "#,
         )?;
         Ok(())
+    }
+
+    pub fn teardown(self) -> Result<(), DbError> {
+        // cleanup happens automatically on consumption of self
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn test_init_teardown_client_database() {
+        let client_id = Uuid::new_v4();
+        let cs = ClientStorage::new(client_id);
+        assert_eq!(cs.is_err(), false);
+        let teardown_result = cs.unwrap().teardown();
+        assert_eq!(teardown_result.is_err(), false);
     }
 }

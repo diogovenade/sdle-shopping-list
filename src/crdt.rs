@@ -892,8 +892,12 @@ mod tests {
 
         m1.merge(&r2);
         m2.merge(&r1);
-
-        assert_eq!(m1.keys(), m2.keys());
+        
+        let mut k1 = m1.keys();
+        let mut k2 = m2.keys();
+        k1.sort();
+        k2.sort();
+        assert_eq!(k1, k2);
 
         for key in m1.keys() {
             let i1 = m1.items.get(&key).unwrap();
