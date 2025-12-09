@@ -1,7 +1,6 @@
 use std::env;
-
-mod server;
-mod client;
+use sdle::client::Client;
+use sdle::server::Server;
 
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
@@ -17,13 +16,13 @@ fn main() {
 
     match run_opt.as_str() {
         "client" => {
-            if let Err(e) = client::client_connect() {
+            if let Err(e) = Client::connect() {
                 eprintln!("Client error: {}", e);
                 std::process::exit(1);
             }
         }
         "server" => {
-            if let Err(e) = server::setup_server() {
+            if let Err(e) = Server::setup_server() {
                 eprintln!("Server error: {}", e);
                 std::process::exit(1);
             }

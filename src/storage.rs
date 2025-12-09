@@ -183,7 +183,7 @@ pub enum DbError {
     Sqlite(#[from] rusqlite::Error),
 }
 
-struct ClientStorage {
+pub struct ClientStorage {
     client_id: Uuid,
     db_path: PathBuf,
     db_conn: Connection,
