@@ -1,32 +1,118 @@
-use crate::crdt::{Item, ShoppingList};
+use crate::crdt::{ShoppingList, GCounter, LWWReg, PNCounter, Item};
 use anyhow::Result;
 use rusqlite::{params, Connection, Result as sqlResult, Row, ToSql};
 use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
+use std::collections::HashMap;
 
-pub trait Stored {
-    fn from_schema() -> Self;
-    fn insert(&self, conn: &Connection, client_id: Uuid) -> Result<()>;
+struct StoredItemRow {
+    item_id: i64,
+    name: String,
+    acquired_val: u32,
+    acquired_clock: u32,
+    acquired_actor: Uuid,
+    p_id: i64,
+    n_id: i64
+}
+
+pub trait Stored: Sized {
+    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self, DbError>;
+    fn insert(&self, conn: &mut Connection, client_id: Uuid) -> Result<()>;
+    fn load_gcounter(conn: &Connection, id: i64, client_id: Uuid) -> Result<GCounter>;
 }
 
 impl Stored for ShoppingList {
-    fn from_schema() -> Self {
-        todo!();
+    fn load_gcounter(conn: &Connection, id: i64, client_id: Uuid) -> Result<GCounter> {
+        let mut stmt = conn.prepare(
+            "SELECT actor_id, value 
+                  FROM gcounter_actor_values
+                  WHERE gcounter_id = ?1"
+        )?;
+
+        let mut counter = HashMap::new();
+
+        let rows = stmt.query_map([id], |row| {
+            let actor: String = row.get(0)?;
+            let value: u64 = row.get(1)?;
+            Ok((Uuid::try_parse(&actor), value))
+        })?;
+
+        for entry in rows {
+            let (actor, value) = entry?;
+            match actor {
+                Ok(actor_uuid) => {
+                    counter.insert(actor_uuid, value);
+                }
+                Err(e) => {
+                    return Err(e.into());
+                }
+            }
+        }
+
+        Ok(GCounter {
+            counter,
+            actor_id: client_id
+        })
     }
 
-    fn insert(&self, conn: &Connection, client_id: Uuid) -> Result<()> {
+    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self, DbError> {
+        let mut stmt = conn.prepare(
+        "SELECT 
+                item_id,
+                item_name,
+                acquired_val,
+                acquired_clock,
+                acquired_actor,
+                p_gcounter_id,
+                n_gcounter_id
+             FROM awormap_items
+             WHERE shopping_list_id = ?1"
+        )?;
+        
+        let rows = stmt.query_map([id.to_string()], |row| {
+            Ok(StoredItemRow {
+                item_id: row.get(0)?,
+                name: row.get(1)?,
+                acquired_val: row.get(2)?,
+                acquired_clock: row.get(3)?,
+                acquired_actor: Uuid::from(row.get(4)?),
+                p_id: row.get(5)?,
+                n_id: row.get(6)?,
+            })
+        })?;
+
+        let mut awormap = AWORMap::new();
+
+        for row_res in rows {
+            let row = row_res?;
+
+            let p = Self::load_gcounter(conn, row.p_id, client_id)?;
+            let n = Self::load_gcounter(conn, row.n_id, client_id)?;
+            let amount = PNCounter { p, n };
+            let acquired = LWWReg::new(
+                row.acquired_val as u32,
+                row.acquired_clock as u32,
+                row.acquired_actor
+            );
+
+            awormap.insert(row.name.clone(), Item { amount, acquired });
+        }
+        Ok(Self { id, list: awormap })
+    }
+
+    fn insert(&self, conn: &mut Connection, client_id: Uuid) -> Result<()> {
         let shopping_list_id = self.id.to_string();
         let map = &self.list; 
 
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction()?;
 
         for (name, item) in &map.items {
             // Insert positive gcounter 
             let p_id = {
                 tx.execute(
-                    "INSERT INTO gcounter (owner_actor) VALUES (?1)",
-                    (&client_id.to_string(),),
+                    "INSERT INTO gcounter DEFAULT VALUES",
+                    (),
                 )?;
 
                 tx.last_insert_rowid()
@@ -35,8 +121,8 @@ impl Stored for ShoppingList {
             // Insert negative gcounter
             let n_id = {
                 tx.execute(
-                    "INSERT INTO gcounter (owner_actor) VALUES (?1)",
-                    (&client_id.to_string(),),
+                    "INSERT INTO gcounter DEFAULT VALUES",
+                    (),
                 )?;
 
                 tx.last_insert_rowid()
@@ -139,7 +225,6 @@ impl ClientStorage {
             r#"
                 CREATE TABLE IF NOT EXISTS gcounter (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    owner_actor TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS gcounter_actor_values (

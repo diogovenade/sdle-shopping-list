@@ -366,23 +366,23 @@ impl Mergeable<PNCounter> for PNCounter {
 #[derive(Clone)]
 pub struct GCounter {
     pub counter: HashMap<Uuid, u64>,
-    pub id: Uuid,
+    pub actor_id: Uuid,
 }
 
 impl GCounter {
-    pub fn new(id: Uuid) -> Self {
+    pub fn new(actor_id: Uuid) -> Self {
         GCounter {
             counter: HashMap::new(),
-            id,
+            actor_id,
         }
     }
 
     pub fn inc(&mut self) {
-        *self.counter.entry(self.id).or_insert(0) += 1;
+        *self.counter.entry(self.actor_id).or_insert(0) += 1;
     }
 
     pub fn value_local(&self) -> u64 {
-        *self.counter.get(&self.id).unwrap_or(&0)
+        *self.counter.get(&self.actor_id).unwrap_or(&0)
     }
 
     pub fn value_total(&self) -> u64 {
