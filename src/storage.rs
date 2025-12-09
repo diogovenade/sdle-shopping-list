@@ -1,4 +1,4 @@
-use crate::crdt::{ShoppingList, GCounter, LWWReg, PNCounter, Item, AWORMap};
+use crate::crdt::{ShoppingList, GCounter, LWWReg, PNCounter, Item, AWORMap, Mergeable};
 use anyhow::Result;
 use rusqlite::{params, Connection, Result as sqlResult, Row, ToSql};
 use std::path::PathBuf;
@@ -122,22 +122,53 @@ impl ClientStorage {
         Ok(())
     }
 
-    pub fn handle_item_storage_request(&self, item_name: String, quantity: u64, acquired: bool, shopping_list_id: Uuid) -> Result<()> {
-        /*let read_result = self.read_item(item_name, shopping_list_id);
+    pub fn handle_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shopping_list_id: Uuid) -> Result<()> {
+        let read_result = self.read_item(&item_name, shopping_list_id);
         
         let item_opt = read_result?;
 
         match item_opt {
-            Some(i) => {
+            Some(mut stored_item) => {
+                let current_quantity = stored_item.amount.value_local();
+                let delta = quantity as i64 - current_quantity;
+
+                let mut local_updated_item = stored_item.clone();
                 
+                // apply pncounter mutations
+                if delta > 0 {
+                    local_updated_item.amount.inc_by(delta as u64); // TODO: does actor id match?
+                } else if delta < 0 {
+                    local_updated_item.amount.dec_by((-delta) as u64);
+                }
+
+                // apply lwwreg mutation
+                let new_acquired_val = acquired as u32;
+                if new_acquired_val != stored_item.acquired.val {
+                    local_updated_item.acquired = LWWReg {
+                        val: new_acquired_val,
+                        clock: stored_item.acquired.clock + 1,
+                        actor: self.client_id,
+                    };
+                }
+
+                stored_item.merge(&local_updated_item);
+
+                self.write_item(&shopping_list_id.to_string(), &stored_item, &item_name)?; // does
+                                                                                           // this
+                                                                                           // override
+                                                                                           // the
+                                                                                           // stuff
+                                                                                           // in
+                                                                                           // the
+                                                                                           // db?
             }
             None => {
-                let new_item = 
+                let new_item = Item::new(quantity, acquired, self.client_id);
+                self.write_item(&shopping_list_id.to_string(), &new_item, &item_name)?;
             }
         }
 
-        Ok(())*/
-        todo!();
+        Ok(())
     }
     
     fn read_gcounter(&self, id: i64) -> Result<GCounter> {
@@ -173,7 +204,7 @@ impl ClientStorage {
         })
     }
 
-    fn read_item(&self, item_name: String, shopping_list_id: Uuid) -> Result<Option<Item>> {
+    fn read_item(&self, item_name: &String, shopping_list_id: Uuid) -> Result<Option<Item>> {
         let mut stmt = self.db_conn.prepare(
         "SELECT 
                 item_id,
@@ -187,7 +218,7 @@ impl ClientStorage {
              WHERE shopping_list_id = ?1 AND item_name = ?2"
         )?;
 
-        let mut rows = stmt.query([shopping_list_id.to_string(), item_name])?;
+        let mut rows = stmt.query([shopping_list_id.to_string(), item_name.clone()])?;
 
         let row = match rows.next()? {
             Some(row) => row,
@@ -262,6 +293,72 @@ impl ClientStorage {
             awormap.insert(row.name, Item { amount, acquired });
         }
         Ok(ShoppingList { id, list: awormap })
+    }
+
+    fn write_item(&mut self, shopping_list_id: &String, item: &Item, item_name: &String) -> Result<()> {
+        let tx = self.db_conn.transaction()?;
+        
+        // Insert positive gcounter
+        let p_id = {
+            tx.execute(
+                "INSERT INTO gcounter DEFAULT VALUES",
+                (),
+            )?;
+
+            tx.last_insert_rowid()
+        };
+        
+        // Insert negative gcounter
+        let n_id = {
+            tx.execute(
+                "INSERT INTO gcounter DEFAULT VALUES",
+                (),
+            )?;
+
+            tx.last_insert_rowid()
+        };
+
+        // Insert positive counter actor counts 
+        for (actor, count) in &item.amount.p.counter {
+            tx.execute(
+                "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)",
+                (&p_id, &actor.to_string(), count),
+            )?;
+        }
+
+        // Insert negative counter actor counts 
+        for (actor, count) in &item.amount.n.counter {
+            tx.execute(
+                "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)", 
+                (&n_id, &actor.to_string(), count),
+            )?;
+        }
+
+        // Insert item 
+        tx.execute(
+            "INSERT INTO awormap_items (
+                shopping_list_id,
+                item_name,
+                acquired_val,
+                acquired_clock,
+                acquired_actor,
+                p_gcounter_id,
+                n_gcounter_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                shopping_list_id,
+                item_name,
+                &item.acquired.val,
+                &item.acquired.clock,
+                &item.acquired.actor.to_string(),
+                &p_id,
+                &n_id,
+            ),
+        )?;
+
+        tx.commit()?;
+        
+        Ok(())
     }
 
     fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {

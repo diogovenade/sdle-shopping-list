@@ -362,8 +362,16 @@ impl PNCounter {
         self.p.inc();
     }
 
+    pub fn inc_by(&mut self, n: u64) {
+        self.p.inc_by(n);
+    }
+
     pub fn dec(&mut self) {
         self.n.inc();
+    }
+
+    pub fn dec_by(&mut self, n: u64) {
+        self.n.inc_by(n);
     }
 
     pub fn value_local(&self) -> i64 {
@@ -405,6 +413,10 @@ impl GCounter {
 
     pub fn inc(&mut self) {
         *self.counter.entry(self.actor_id).or_insert(0) += 1;
+    }
+
+    pub fn inc_by(&mut self, n: u64) {
+        *self.counter.entry(self.actor_id).or_insert(0) += n;
     }
 
     pub fn value_local(&self) -> u64 {
