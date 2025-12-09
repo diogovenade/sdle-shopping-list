@@ -1,4 +1,4 @@
-use crate::crdt::{ShoppingList, GCounter, LWWReg, PNCounter, Item};
+use crate::crdt::{ShoppingList, GCounter, LWWReg, PNCounter, Item, AWORMap};
 use anyhow::Result;
 use rusqlite::{params, Connection, Result as sqlResult, Row, ToSql};
 use std::path::PathBuf;
@@ -11,14 +11,14 @@ struct StoredItemRow {
     name: String,
     acquired_val: u32,
     acquired_clock: u32,
-    acquired_actor: Uuid,
+    acquired_actor: String,
     p_id: i64,
     n_id: i64
 }
 
 pub trait Stored: Sized {
-    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self, DbError>;
-    fn insert(&self, conn: &mut Connection, client_id: Uuid) -> Result<()>;
+    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self>;
+    fn insert(&self, conn: &mut Connection) -> Result<()>;
     fn load_gcounter(conn: &Connection, id: i64, client_id: Uuid) -> Result<GCounter>;
 }
 
@@ -56,7 +56,7 @@ impl Stored for ShoppingList {
         })
     }
 
-    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self, DbError> {
+    fn from_schema(id: Uuid, conn: &Connection, client_id: Uuid) -> Result<Self> {
         let mut stmt = conn.prepare(
         "SELECT 
                 item_id,
@@ -76,7 +76,7 @@ impl Stored for ShoppingList {
                 name: row.get(1)?,
                 acquired_val: row.get(2)?,
                 acquired_clock: row.get(3)?,
-                acquired_actor: Uuid::from(row.get(4)?),
+                acquired_actor: row.get(4)?,
                 p_id: row.get(5)?,
                 n_id: row.get(6)?,
             })
@@ -90,18 +90,20 @@ impl Stored for ShoppingList {
             let p = Self::load_gcounter(conn, row.p_id, client_id)?;
             let n = Self::load_gcounter(conn, row.n_id, client_id)?;
             let amount = PNCounter { p, n };
+
+            let actor_uuid = Uuid::try_parse(row.acquired_actor.as_str())?; 
             let acquired = LWWReg::new(
                 row.acquired_val as u32,
                 row.acquired_clock as u32,
-                row.acquired_actor
+                actor_uuid
             );
 
-            awormap.insert(row.name.clone(), Item { amount, acquired });
+            awormap.insert(row.name, Item { amount, acquired });
         }
         Ok(Self { id, list: awormap })
     }
 
-    fn insert(&self, conn: &mut Connection, client_id: Uuid) -> Result<()> {
+    fn insert(&self, conn: &mut Connection) -> Result<()> {
         let shopping_list_id = self.id.to_string();
         let map = &self.list; 
 
@@ -160,7 +162,7 @@ impl Stored for ShoppingList {
                     name,
                     &item.acquired.val,
                     &item.acquired.clock,
-                    item.acquired.actor.to_string(),
+                    &item.acquired.actor.to_string(),
                     &p_id,
                     &n_id,
                 ),

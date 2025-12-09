@@ -18,7 +18,8 @@ pub struct ShoppingList {
 #[derive(Clone)]
 pub struct Item {
     pub amount: PNCounter,
-    pub acquired: LWWReg<Uuid>, //TODO:weak causality, consider swapping for MVReg
+    pub acquired: LWWReg<Uuid>, //TODO: weak causality, consider swapping for MVReg
+                                //NOTE: acquired to be treated as bool
 }
 
 impl Mergeable<Item> for Item {
