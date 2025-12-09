@@ -22,6 +22,18 @@ pub struct Item {
                                 //NOTE: acquired to be treated as bool
 }
 
+impl Item {
+    pub fn new(quantity: u64, acquired: bool, client_id: Uuid) -> Self {
+        let amount = PNCounter::with_count(client_id, quantity);
+        let acquired = LWWReg {
+            val: acquired as u32, 
+            clock: 0u32, 
+            actor: client_id,
+        };
+        Item { amount, acquired }
+    }
+}
+
 impl Mergeable<Item> for Item {
     fn merge(&mut self, other: &Item) {
         self.amount.merge(&other.amount);
@@ -339,6 +351,13 @@ impl PNCounter {
         }
     }
 
+    pub fn with_count(id: Uuid, amount: u64) -> Self {
+        let p = GCounter::with_count(id, amount);
+        let n = GCounter::new(id);
+
+        PNCounter { p, n }
+    }
+
     pub fn inc(&mut self) {
         self.p.inc();
     }
@@ -376,6 +395,12 @@ impl GCounter {
             counter: HashMap::new(),
             actor_id,
         }
+    }
+
+    pub fn with_count(actor_id: Uuid, count: u64) -> Self {
+        let mut counter = HashMap::new();
+        counter.insert(actor_id, count);
+        GCounter { counter, actor_id }
     }
 
     pub fn inc(&mut self) {
@@ -893,7 +918,7 @@ mod tests {
 
         m1.merge(&r2);
         m2.merge(&r1);
-        
+
         let mut k1 = m1.keys();
         let mut k2 = m2.keys();
         k1.sort();

@@ -16,11 +16,6 @@ struct StoredItemRow {
     n_id: i64
 }
 
-impl ShoppingList {
-
-
-}
-
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("IO error: {0}")]
@@ -127,8 +122,22 @@ impl ClientStorage {
         Ok(())
     }
 
-    pub fn handle_item_storage_request(&self, item_name: &'static str, quantity: u64, acquired: bool, shoppinglist_id: Uuid) {
-        todo!(); 
+    pub fn handle_item_storage_request(&self, item_name: String, quantity: u64, acquired: bool, shopping_list_id: Uuid) -> Result<()> {
+        /*let read_result = self.read_item(item_name, shopping_list_id);
+        
+        let item_opt = read_result?;
+
+        match item_opt {
+            Some(i) => {
+                
+            }
+            None => {
+                let new_item = 
+            }
+        }
+
+        Ok(())*/
+        todo!();
     }
     
     fn read_gcounter(&self, id: i64) -> Result<GCounter> {
@@ -162,6 +171,50 @@ impl ClientStorage {
             counter,
             actor_id: self.client_id
         })
+    }
+
+    fn read_item(&self, item_name: String, shopping_list_id: Uuid) -> Result<Option<Item>> {
+        let mut stmt = self.db_conn.prepare(
+        "SELECT 
+                item_id,
+                item_name,
+                acquired_val,
+                acquired_clock,
+                acquired_actor,
+                p_gcounter_id,
+                n_gcounter_id
+             FROM awormap_items
+             WHERE shopping_list_id = ?1 AND item_name = ?2"
+        )?;
+
+        let mut rows = stmt.query([shopping_list_id.to_string(), item_name])?;
+
+        let row = match rows.next()? {
+            Some(row) => row,
+            None => return Ok(None),
+        };
+
+        let _item_id: i64 = row.get(0)?; // useless id
+        let _name: String = row.get(1)?; // you already know the name because you passed it in
+        let acquired_val: u32 = row.get(2)?;
+        let acquired_clock: u32 = row.get(3)?;
+        let acquired_actor_string: String = row.get(4)?;
+        let p_id: i64 = row.get(5)?;
+        let n_id: i64 = row.get(6)?;
+
+        let acquired_actor = Uuid::parse_str(&acquired_actor_string)?;
+
+        let p = self.read_gcounter(p_id)?;
+        let n = self.read_gcounter(n_id)?;
+        let amount = PNCounter { p, n };
+
+        let acquired = LWWReg {
+            val: acquired_val,
+            clock: acquired_clock,
+            actor: acquired_actor,
+        };
+
+        Ok(Some(Item { amount, acquired }))
     }
 
     fn read_shopping_list(&self, id: Uuid) -> Result<ShoppingList> {
