@@ -184,32 +184,48 @@ pub enum DbError {
 }
 
 pub struct ClientStorage {
-    client_id: Uuid,
+    pub client_id: Uuid,
     db_path: PathBuf,
     db_conn: Connection,
-    cached_lists: Vec<ShoppingList>,
+    pub cached_lists: Vec<ShoppingList>,
 }
 
 impl ClientStorage {
-    pub fn new(client_id: Uuid) -> Result<Self, DbError> {
+    pub fn new() -> Result<Self> {
         let db_path = Self::compute_db_path()?;
-        println!("Computed db_path successfully.");
         let db_conn = Connection::open(&db_path)?;
-        println!("Database connection established successfully.");
-        
         db_conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         db_conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-        println!("Pragmas executed successfully.");
-
         Self::initialize_schema(&db_conn)?;
-        println!("Schema initialized successfully.");
-
+        let client_id = Self::request_client_id(&db_conn)?;
         Ok(ClientStorage {
             client_id,
             db_path,
             db_conn,
             cached_lists: Vec::new(),
         })
+    }
+
+    fn request_client_id(conn: &Connection) -> Result<Uuid> {
+        let mut stmt = conn.prepare(
+            "SELECT value 
+                  FROM client_metadata
+                  WHERE key = 'client_id'"
+        )?;
+        
+        let mut rows = stmt.query([])?;
+
+        if let Some(row) = rows.next()? {
+            let s: String = row.get(0)?;
+            return Ok(Uuid::try_parse(s.as_str())?);
+        }
+
+        let id = Uuid::new_v4();
+        conn.execute(
+            "INSERT INTO client_metadata (key, value) VALUES ('client_id', ?1)",
+            [&id.to_string()],
+        )?;
+        Ok(id)
     }
 
     fn compute_db_path() -> std::io::Result<PathBuf> {
@@ -225,6 +241,11 @@ impl ClientStorage {
     fn initialize_schema(db_conn: &Connection) -> Result<(), DbError> {
         db_conn.execute_batch(
             r#"
+                CREATE TABLE IF NOT EXISTS client_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
+                
                 CREATE TABLE IF NOT EXISTS gcounter (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                 );

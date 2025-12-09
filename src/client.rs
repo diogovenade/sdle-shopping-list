@@ -1,6 +1,7 @@
 use uuid::Uuid;
 use zmq::{Context, Error as zmqErr, SocketType};
 use crate::storage::{ClientStorage};
+use anyhow::Result;
 
 pub struct Client {
     id: Uuid,
@@ -8,7 +9,15 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn connect() -> Result<(), zmqErr> {
+    pub fn new() -> Result<Self> {
+        let storage_handler = ClientStorage::new()?;
+        Ok(Self {
+            id: storage_handler.client_id,
+            storage_handler,
+        })
+    }
+
+    pub fn connect(&self) -> Result<(), zmqErr> {
         println!("Connecting to server...");
         let context = Context::new();
         let requester = context.socket(SocketType::REQ)?;

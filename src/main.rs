@@ -1,12 +1,13 @@
 use std::env;
 use sdle::client::Client;
 use sdle::server::Server;
+use anyhow::{Result};
 
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
 }
 
-fn main() {
+fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     let Some(run_opt) = args.get(1) else {
@@ -16,7 +17,8 @@ fn main() {
 
     match run_opt.as_str() {
         "client" => {
-            if let Err(e) = Client::connect() {
+            let client = Client::new()?;
+            if let Err(e) = client.connect() {
                 eprintln!("Client error: {}", e);
                 std::process::exit(1);
             }
@@ -32,4 +34,6 @@ fn main() {
             std::process::exit(1);
         }
     }
+
+    Ok(())
 }
