@@ -17,6 +17,10 @@ impl Client {
         })
     }
 
+    pub fn send_item_storage_request(&self, item_name: &'static str, quantity: u64, acquired: bool, shoppinglist_id: Uuid) {
+        self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id); 
+    }
+
     pub fn connect(&self) -> Result<(), zmqErr> {
         println!("Connecting to server...");
         let context = Context::new();
