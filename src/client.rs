@@ -28,7 +28,7 @@ impl ShoppingListInterface {
 }
 
 pub struct Client {
-    id: Uuid,
+    pub id: Uuid,
     storage_handler: ClientStorage,
 }
 
