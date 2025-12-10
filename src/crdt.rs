@@ -22,6 +22,18 @@ pub struct Item {
                                 //NOTE: acquired to be treated as bool
 }
 
+impl Item {
+    pub fn new(quantity: u64, acquired: bool, client_id: Uuid) -> Self {
+        let amount = PNCounter::with_count(client_id, quantity);
+        let acquired = LWWReg {
+            val: acquired as u32, 
+            clock: 0u32, 
+            actor: client_id,
+        };
+        Item { amount, acquired }
+    }
+}
+
 impl Mergeable<Item> for Item {
     fn merge(&mut self, other: &Item) {
         self.amount.merge(&other.amount);
@@ -339,12 +351,27 @@ impl PNCounter {
         }
     }
 
+    pub fn with_count(id: Uuid, amount: u64) -> Self {
+        let p = GCounter::with_count(id, amount);
+        let n = GCounter::with_count(id, 0);
+
+        PNCounter { p, n }
+    }
+
     pub fn inc(&mut self) {
         self.p.inc();
     }
 
+    pub fn inc_by(&mut self, n: u64) {
+        self.p.inc_by(n);
+    }
+
     pub fn dec(&mut self) {
         self.n.inc();
+    }
+
+    pub fn dec_by(&mut self, n: u64) {
+        self.n.inc_by(n);
     }
 
     pub fn value_local(&self) -> i64 {
@@ -378,8 +405,18 @@ impl GCounter {
         }
     }
 
+    pub fn with_count(actor_id: Uuid, count: u64) -> Self {
+        let mut counter = HashMap::new();
+        counter.insert(actor_id, count);
+        GCounter { counter, actor_id }
+    }
+
     pub fn inc(&mut self) {
         *self.counter.entry(self.actor_id).or_insert(0) += 1;
+    }
+
+    pub fn inc_by(&mut self, n: u64) {
+        *self.counter.entry(self.actor_id).or_insert(0) += n;
     }
 
     pub fn value_local(&self) -> u64 {
@@ -893,7 +930,7 @@ mod tests {
 
         m1.merge(&r2);
         m2.merge(&r1);
-        
+
         let mut k1 = m1.keys();
         let mut k2 = m2.keys();
         k1.sort();
