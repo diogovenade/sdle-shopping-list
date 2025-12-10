@@ -128,7 +128,9 @@ impl ClientStorage {
         let item_opt = read_result?;
 
         match item_opt {
-            Some(mut stored_item) => {
+            Some(stored_item_row) => {
+                let mut stored_item = self.build_item(&stored_item_row)?;
+
                 let current_quantity = stored_item.amount.value_local();
                 let delta = quantity as i64 - current_quantity;
 
@@ -153,14 +155,7 @@ impl ClientStorage {
 
                 stored_item.merge(&local_updated_item);
 
-                self.write_item(&shopping_list_id.to_string(), &stored_item, &item_name)?; // does
-                                                                                           // this
-                                                                                           // override
-                                                                                           // the
-                                                                                           // stuff
-                                                                                           // in
-                                                                                           // the
-                                                                                           // db?
+                self.overwrite_item(&stored_item, stored_item_row.item_id, stored_item_row.p_id, stored_item_row.n_id)?;
             }
             None => {
                 let new_item = Item::new(quantity, acquired, self.client_id);
@@ -204,7 +199,7 @@ impl ClientStorage {
         })
     }
 
-    fn read_item(&self, item_name: &String, shopping_list_id: Uuid) -> Result<Option<Item>> {
+    fn read_item(&self, item_name: &String, shopping_list_id: Uuid) -> Result<Option<StoredItemRow>> {
         let mut stmt = self.db_conn.prepare(
         "SELECT 
                 item_id,
@@ -225,27 +220,15 @@ impl ClientStorage {
             None => return Ok(None),
         };
 
-        let _item_id: i64 = row.get(0)?; // useless id
-        let _name: String = row.get(1)?; // you already know the name because you passed it in
-        let acquired_val: u32 = row.get(2)?;
-        let acquired_clock: u32 = row.get(3)?;
-        let acquired_actor_string: String = row.get(4)?;
-        let p_id: i64 = row.get(5)?;
-        let n_id: i64 = row.get(6)?;
-
-        let acquired_actor = Uuid::parse_str(&acquired_actor_string)?;
-
-        let p = self.read_gcounter(p_id)?;
-        let n = self.read_gcounter(n_id)?;
-        let amount = PNCounter { p, n };
-
-        let acquired = LWWReg {
-            val: acquired_val,
-            clock: acquired_clock,
-            actor: acquired_actor,
-        };
-
-        Ok(Some(Item { amount, acquired }))
+        Ok(Some(StoredItemRow {
+            item_id: row.get(0)?,
+            name: row.get(1)?,
+            acquired_val: row.get(2)?,
+            acquired_clock: row.get(3)?,
+            acquired_actor: row.get(4)?,
+            p_id: row.get(5)?,
+            n_id: row.get(6)?,
+        }))
     }
 
     fn read_shopping_list(&self, id: Uuid) -> Result<ShoppingList> {
@@ -278,21 +261,76 @@ impl ClientStorage {
 
         for row_res in rows {
             let row = row_res?;
+            let item = self.build_item(&row)?;
 
-            let p = self.read_gcounter(row.p_id)?;
-            let n = self.read_gcounter(row.n_id)?;
-            let amount = PNCounter { p, n };
-
-            let actor_uuid = Uuid::try_parse(row.acquired_actor.as_str())?; 
-            let acquired = LWWReg::new(
-                row.acquired_val as u32,
-                row.acquired_clock as u32,
-                actor_uuid
-            );
-
-            awormap.insert(row.name, Item { amount, acquired });
+            awormap.insert(row.name, item);
         }
         Ok(ShoppingList { id, list: awormap })
+    }
+
+    fn build_item(&self, intermediate: &StoredItemRow) -> Result<Item> {
+        let p = self.read_gcounter(intermediate.p_id)?; 
+        let n = self.read_gcounter(intermediate.n_id)?;
+        let amount = PNCounter { p, n };
+
+        let actor_uuid = Uuid::try_parse(&intermediate.acquired_actor.as_str())?;
+        let acquired = LWWReg::new(
+            intermediate.acquired_val as u32,
+            intermediate.acquired_clock as u32,
+            actor_uuid
+        );
+
+        Ok(Item { amount, acquired })
+    }
+
+    fn overwrite_item(&mut self, item: &Item, item_id: i64, p_gcounter_id: i64, n_gcounter_id: i64) -> Result<()> {
+        let tx = self.db_conn.transaction()?;
+
+        tx.execute(
+            "UPDATE awormap_items
+                    SET acquired_val = ?1,
+                        acquired_clock = ?2,
+                        acquired_actor = ?3,
+                    WHERE item_id = ?4",
+                    params![
+                    item.acquired.val as i64,
+                    item.acquired.clock as i64,
+                    item.acquired.actor.to_string(),
+                    item_id,
+                    ],
+        )?;
+        
+        {
+            let mut stmt_upsert = tx.prepare(
+                "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value)
+                     VALUES (?1, ?2, ?3)
+                 ON CONFLICT(gcounter_id, actor_id) DO UPDATE SET value = excluded.value"
+            )?;
+
+            for (actor_uuid, &val_u64) in &item.amount.p.counter {
+                let actor_str = actor_uuid.to_string();
+                let val_i64 = val_u64 as i64;
+                stmt_upsert.execute(params![p_gcounter_id, actor_str, val_i64])?;
+            }
+        }
+
+        {
+            let mut stmt_upsert = tx.prepare(
+                "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value)
+                     VALUES (?1, ?2, ?3)
+                 ON CONFLICT(gcounter_id, actor_id) DO UPDATE SET value = excluded.value"
+            )?;
+
+            for (actor_uuid, &val_u64) in &item.amount.n.counter {
+                let actor_str = actor_uuid.to_string();
+                let val_i64 = val_u64 as i64;
+                stmt_upsert.execute(params![n_gcounter_id, actor_str, val_i64])?;
+            }
+        }
+
+        tx.commit()?;
+
+        Ok(())
     }
 
     fn write_item(&mut self, shopping_list_id: &String, item: &Item, item_name: &String) -> Result<()> {
