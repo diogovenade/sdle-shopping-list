@@ -17,8 +17,9 @@ impl Client {
         })
     }
 
-    pub fn send_item_storage_request(&self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) {
-        let _ = self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id); 
+    pub fn send_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) -> Result<()> {
+        self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id)?; 
+        Ok(())
     }
 
     pub fn connect(&self) -> Result<(), zmqErr> {

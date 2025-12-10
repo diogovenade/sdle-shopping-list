@@ -2,6 +2,7 @@ use std::env;
 use sdle::client::Client;
 use sdle::server::Server;
 use anyhow::{Result};
+use uuid::Uuid;
 
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
@@ -17,11 +18,8 @@ fn main() -> Result<()> {
 
     match run_opt.as_str() {
         "client" => {
-            let client = Client::new()?;
-            if let Err(e) = client.connect() {
-                eprintln!("Client error: {}", e);
-                std::process::exit(1);
-            }
+            let mut client = Client::new()?;
+            // client.send_item_storage_request("apples".to_string(), 10, false, Uuid::new_v4())?;
         }
         "server" => {
             if let Err(e) = Server::setup_server() {

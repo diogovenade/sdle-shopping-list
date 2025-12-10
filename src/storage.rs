@@ -88,7 +88,7 @@ impl ClientStorage {
                 );
                 
                 CREATE TABLE IF NOT EXISTS gcounter (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id INTEGER PRIMARY KEY AUTOINCREMENT
                 );
 
                 CREATE TABLE IF NOT EXISTS gcounter_actor_values (

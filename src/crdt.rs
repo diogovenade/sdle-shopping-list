@@ -353,7 +353,7 @@ impl PNCounter {
 
     pub fn with_count(id: Uuid, amount: u64) -> Self {
         let p = GCounter::with_count(id, amount);
-        let n = GCounter::new(id);
+        let n = GCounter::with_count(id, 0);
 
         PNCounter { p, n }
     }
