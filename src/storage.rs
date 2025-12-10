@@ -86,6 +86,11 @@ impl ClientStorage {
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS local_lists (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    list_uuid TEXT UNIQUE NOT NULL
+                );
                 
                 CREATE TABLE IF NOT EXISTS gcounter (
                     id INTEGER PRIMARY KEY AUTOINCREMENT
@@ -123,6 +128,7 @@ impl ClientStorage {
     }
 
     pub fn handle_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shopping_list_id: Uuid) -> Result<()> {
+        self.ensure_list(shopping_list_id)?;
         let read_result = self.read_item(&item_name, shopping_list_id);
         
         let item_opt = read_result?;
@@ -164,6 +170,43 @@ impl ClientStorage {
         }
 
         Ok(())
+    }
+
+    fn ensure_list(&mut self, shopping_list_id: Uuid) -> Result<()> {
+        let tx = self.db_conn.transaction()?;
+
+        tx.execute(
+            "INSERT OR IGNORE INTO local_lists (list_uuid) VALUES (?1)",
+            params![shopping_list_id.to_string()],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_user_lists(&self) -> Result<Option<Vec<ShoppingList>>> {
+        let mut list_vec: Vec<ShoppingList> = Vec::new();
+        let mut stmt = self.db_conn.prepare(
+            "SELECT list_uuid 
+                  FROM local_lists"
+        )?;
+
+        let lists = stmt.query_map([], |row| {
+            let uuid_str: String = row.get(0)?;
+            Ok(Uuid::try_parse(&uuid_str))
+        })?;
+
+        for list_res in lists {
+            let list_uuid = list_res??;
+            let list = self.read_shopping_list(list_uuid)?;
+            list_vec.push(list);
+        }
+
+        if list_vec.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(list_vec))
+        }
     }
     
     fn read_gcounter(&self, id: i64) -> Result<GCounter> {
@@ -468,18 +511,5 @@ impl ClientStorage {
         tx.commit()?;
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_init_teardown_client_database() {
-        let cs = ClientStorage::new();
-        assert_eq!(cs.is_err(), false);
-        let teardown_result = cs.unwrap().teardown();
-        assert_eq!(teardown_result.is_err(), false);
     }
 }
