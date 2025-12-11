@@ -13,3 +13,4 @@ zmq = "0.10.0"
 md-5 = "0.10.6"
 thiserror = "2.0.17"
 rusqlite = { "version"= "0.37.0", features = ["bundled", "uuid"]}
+rand = "0.9.2"

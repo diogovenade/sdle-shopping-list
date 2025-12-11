@@ -4,6 +4,18 @@ use sdle::client::Client;
 use sdle::server::Server;
 use std::env;
 use uuid::Uuid;
+use std::{
+    env,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
+
+use uuid::Uuid;
+
+use crate::server::{Peer, SharedPeer};
+
+mod client;
+mod server;
 
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
@@ -26,9 +38,60 @@ fn main() -> Result<()> {
             }
         }
         "server" => {
-            if let Err(e) = Server::setup_server() {
-                eprintln!("Server error: {}", e);
-                std::process::exit(1);
+            let seed_addr = "tcp://127.0.0.1:6000";
+
+            let p1 = Peer::new("peer1", &seed_addr)?;
+            let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001")?;
+            let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002")?;
+
+            let sp1: SharedPeer = Arc::new(Mutex::new(p1));
+            let sp2: SharedPeer = Arc::new(Mutex::new(p2));
+            let sp3: SharedPeer = Arc::new(Mutex::new(p3));
+
+            // start seed node first
+            Peer::start(Arc::clone(&sp1));
+
+            std::thread::sleep(Duration::from_millis(100));
+
+            {
+                let mut g = sp2.lock().unwrap();
+                match g.join(seed_addr) {
+                    Ok(_) => {},
+                    Err(e) => eprintln!("Peer 2 failed to join: {}", e),
+                }
+            }
+
+            {
+                let mut g = sp3.lock().unwrap();
+                match g.join(seed_addr) {
+                    Ok(_) => {},
+                    Err(e) => eprintln!("Peer 3 failed to join: {}", e),
+                }
+            }
+
+            Peer::start(Arc::clone(&sp2));
+            Peer::start(Arc::clone(&sp3));
+
+            // to test -> peer 2 pings peer 3 every 2 seconds
+            {
+                let sp2_clone = Arc::clone(&sp2);
+                std::thread::spawn(move || {
+                    loop {
+                        {
+                            let mut p2_guard = sp2_clone.lock().unwrap();
+                            if let Err(e) = p2_guard.ping("peer3") {
+                                eprintln!("[p2 -> p3] Ping failed: {}", e);
+                            } else {
+                                println!("[p2 -> p3] Ping sent");
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(2));
+                    }
+                });
+            }
+
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
             }
         }
         _ => {
