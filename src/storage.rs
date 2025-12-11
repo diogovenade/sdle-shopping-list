@@ -3,6 +3,7 @@ use anyhow::Result;
 use rusqlite::{Connection, Result as sqlResult, Row, ToSql, params};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -529,10 +530,125 @@ impl ClientStorage {
 }
 
 pub struct ServerStorage {
-    pub server_id: Uuid,
     path: PathBuf,
     conn: Connection,
-    pub cached_lists: Vec<ShoppingList>,
 }
 
+impl ServerStorage {
+    pub fn new(uuid: &str) -> Result<Self> {
+        let path = Self::compute_db_path(uuid)?;
+        let conn = Connection::open(&path)?;
 
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+
+        Self::initialize_schema(&conn)?;
+
+        Ok(Self { path, conn })
+    }
+
+    fn compute_db_path(uuid: &str) -> std::io::Result<PathBuf> {
+        let mut root = std::env::current_dir()?;
+
+        root.push("data");
+        root.push("serverstorage");
+        std::fs::create_dir_all(&root)?;
+
+        let file = format!("server-{}.db", uuid);
+        root.push(file);
+        Ok(root)
+    }
+
+    fn initialize_schema(conn: &Connection) -> Result<()> {
+        // TODO: acho que isto chega mas continuar a verificar
+
+        // created_at secalhar ajuda -> podemos dar query por hinted_handoff != null e sort por mais antigos
+        conn.execute_batch(
+            "
+            CREATE TABLE shopping_lists (
+                id              TEXT PRIMARY KEY UNIQUE NOT NULL,
+                crdt_data       BLOB NOT NULL,
+                hinted_handoff  TEXT
+            )",
+        )?;
+
+        Ok(())
+    }
+
+    fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
+        let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
+
+        let tx = self.conn.transaction()?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
+         VALUES (?1, ?2, ?3)",
+            params![shopping_list.id.to_string(), data, None::<String>],
+        )?;
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn write_shopping_list_handoff(
+        &mut self,
+        shopping_list: &ShoppingList,
+        uuid: &str,
+    ) -> Result<()> {
+        let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
+
+        let tx = self.conn.transaction()?;
+
+        tx.execute(
+            "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
+         VALUES (?1, ?2, ?3)",
+            params![shopping_list.id.to_string(), data, uuid],
+        )?;
+
+        tx.commit()?;
+
+        Ok(())
+    }
+
+    fn get_shopping_list(&self, shopping_list_id: &Uuid) -> Result<Option<ShoppingList>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT crdt_data FROM shopping_lists WHERE id = ?1")?;
+
+        let list_id_str = shopping_list_id.to_string();
+
+        let mut rows = stmt.query(params![list_id_str])?;
+
+        if let Some(row) = rows.next()? {
+            let data: Vec<u8> = row.get(0)?;
+            let list: ShoppingList = serde_json::from_slice(&data)?;
+
+            return Ok(Some(list));
+        }
+
+        Ok(None)
+    }
+
+    // return dest + shopping list
+    fn get_hinted_handoffs(&self) -> Result<Vec<(Uuid, ShoppingList)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT crdt_data, hinted_handoff FROM shopping_lists WHERE hinted_handoff IS NOT NULL",
+        )?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let data: Vec<u8> = row.get(0)?;
+                let uuid_raw: String = row.get(1)?;
+
+                // TODO: nao usar unwraps, nao percebo pq nao consigo usar '?'
+                let shopping_list: ShoppingList = serde_json::from_slice(&data).unwrap();
+                let uuid = Uuid::parse_str(&uuid_raw).unwrap();
+
+                Ok((uuid, shopping_list))
+            })?
+            .collect::<Result<Vec<(Uuid, ShoppingList)>, _>>()?;
+
+        Ok(rows)
+    }
+}
