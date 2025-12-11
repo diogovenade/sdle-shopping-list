@@ -27,6 +27,13 @@ impl ShoppingListInterface {
     }
 }
 
+#[derive(Clone)]
+pub struct ItemInterface {
+    pub name: String,
+    pub amount: u64,
+    pub acquired: bool,
+}
+
 pub struct Client {
     pub id: Uuid,
     storage_handler: ClientStorage,
