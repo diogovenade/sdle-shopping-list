@@ -565,7 +565,7 @@ impl ServerStorage {
         // created_at secalhar ajuda -> podemos dar query por hinted_handoff != null e sort por mais antigos
         conn.execute_batch(
             "
-            CREATE TABLE shopping_lists (
+            CREATE TABLE IF NOT EXISTS shopping_lists (
                 id              TEXT PRIMARY KEY UNIQUE NOT NULL,
                 crdt_data       BLOB NOT NULL,
                 hinted_handoff  TEXT
