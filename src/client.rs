@@ -41,7 +41,7 @@ impl Client {
         })
     }
 
-    pub fn show_available_lists(&self) -> Result<Option<Vec<ShoppingListInterface>>> {
+    pub fn retrieve_available_lists(&self) -> Result<Option<Vec<ShoppingListInterface>>> {
         let lists = self.storage_handler.get_user_lists()?;
 
         match lists {
@@ -56,6 +56,14 @@ impl Client {
                 Ok(None)
             }
         }
+    }
+
+    pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
+        let list = self.storage_handler.read_shopping_list(list_id)?;
+
+        let list_interface = ShoppingListInterface::from_crdt(&list);
+
+        Ok(list_interface)
     }
 
     pub fn send_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) -> Result<()> {

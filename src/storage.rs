@@ -274,7 +274,7 @@ impl ClientStorage {
         }))
     }
 
-    fn read_shopping_list(&self, id: Uuid) -> Result<ShoppingList> {
+    pub fn read_shopping_list(&self, id: Uuid) -> Result<ShoppingList> {
         let mut stmt = self.db_conn.prepare(
         "SELECT 
                 item_id,

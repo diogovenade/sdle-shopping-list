@@ -1,11 +1,21 @@
+use crate::client::{Client, ShoppingListInterface};
+use std::{
+    io::{self, Write},
+    ops::RangeBounds,
+};
 use uuid::Uuid;
-use crate::client::Client;
-use std::io::{self, Write};
 
 const CLEAR_SEQUENCE: &'static str = "\x1B[2J\x1B[1;1H";
 
+enum InputRule<'a> {
+    AcceptStrings(&'a [&'a str]),
+    AcceptNumberRange { low: usize, high: usize },
+    Custom(Box<dyn Fn(&str) -> bool + 'a>),
+}
+
 enum State {
-    ListShow(Uuid),
+    ListCreate(Uuid),
+    ListEdit(Uuid),
     MainMenu,
     Exit,
 }
@@ -29,13 +39,42 @@ impl ClientInterfaceManager {
                 let client_id = self.client.id;
                 print!("{}", CLEAR_SEQUENCE);
                 println!("Logged in as client: {}", client_id.to_string());
-                println!("Press q to quit.");
+                let list_vec = self.print_lists();
+                println!("Commands: q - quit; <nr> - open list number <nr>; a - add new list;");
                 let mut input = String::new();
-                Self::loop_input(&mut input, &["q"]);
-                self.handle_main_menu(input);
+                Self::read_validated_input(
+                    &mut input,
+                    &[
+                        InputRule::AcceptStrings(&["a", "q"]),
+                        InputRule::AcceptNumberRange {
+                            low: 1,
+                            high: list_vec.len(),
+                        },
+                    ],
+                );
+                self.handle_main_menu(input, &list_vec);
             }
-            State::ListShow(list_id) => {
-                todo!(); 
+            State::ListCreate(list_id) => {
+                println!("You are editing a new list! Get started adding some items.");
+            }
+            State::ListEdit(list_id) => {
+                println!("Loading...");
+                let mut input = String::new();
+                if let Ok(list) = self.client.retrieve_list(list_id) {
+                    print!("{}", CLEAR_SEQUENCE);
+                    Self::print_list_items(&list);
+
+                    println!("\nCommands: q - quit; b- back to menu; MORE TODO;");
+                    Self::read_validated_input(&mut input, &[
+                        InputRule::AcceptStrings(&["q", "b"]),
+                    ]);
+                    self.handle_list_edit(input);
+                } else {
+                    println!("Error retrieving list items.");
+                    self.screen = State::MainMenu;
+                    io::stdout().flush().unwrap();
+                    let _ = io::stdin().read_line(&mut input);
+                } 
             }
             State::Exit => {
                 // byebye
@@ -43,11 +82,91 @@ impl ClientInterfaceManager {
         }
     }
 
+    fn handle_list_edit(&mut self, input: String) {
+        match input.as_str() {
+            "q" => {
+                self.screen = State::Exit;
+            }
+            "b" => {
+                self.screen = State::MainMenu;
+            }
+            other => {
+                println!("Unknown command: {}", other); // safeguard
+            }
+        }
+    }
+
+    fn handle_main_menu(&mut self, input: String, lists: &Vec<Uuid>) {
+        match input.as_str() {
+            "q" => {
+                self.screen = State::Exit;
+            }
+            "a" => {
+                self.screen = State::ListCreate(Uuid::new_v4());
+            }
+            other => {
+                if let Ok(selection) = other.parse::<usize>() {
+                    let index = selection.checked_sub(1);
+
+                    if let Some(idx) = index {
+                        if idx < lists.len() {
+                            let chosen_list_id = lists[idx];
+                            self.screen = State::ListEdit(chosen_list_id);
+                            return;
+                        }
+                    }
+
+                    println!("Invalid selection: {}", other);
+                    return;
+                }
+                println!("Unknown command: {}", other); // probably won't reach this point but meh
+            }
+        }
+    }
+
+    fn print_list_items(list: &ShoppingListInterface) {
+        println!("You are viewing list {}", list.list_id);
+
+        for (item_name, item) in list.items.iter() {
+            print!("{item_name} - qty: {}", item.0);
+            if item.1 {
+                println!("☒");
+            } else {
+                println!("☐");
+            }
+        }
+    }
+
+    fn print_lists(&self) -> Vec<Uuid> {
+        let mut shopping_list_vec = Vec::new();
+        match self.client.retrieve_available_lists() {
+            Ok(Some(lists)) => {
+                println!("Available lists:");
+                for i in 1..=lists.len() {
+                    let list_id = lists
+                        .get(i - 1)
+                        .expect("Indexing error on lists...")
+                        .list_id;
+                    println!("{i}: {list_id}");
+                    shopping_list_vec.push(list_id);
+                }
+            }
+            Ok(None) => {
+                println!("No lists available locally.");
+            }
+            Err(e) => {
+                println!("Error when retrieving lists: {e}");
+            }
+        }
+
+        shopping_list_vec
+    }
+
     pub fn is_done(&self) -> bool {
         matches!(self.screen, State::Exit)
     }
 
-    fn loop_input(dest: &mut String, acceptable: &[&str]) {
+    fn read_validated_input(dest: &mut String, rules: &[InputRule<'_>]) {
         loop {
             dest.clear();
             io::stdout().flush().unwrap();
@@ -55,30 +174,47 @@ impl ClientInterfaceManager {
             match io::stdin().read_line(dest) {
                 Ok(_) => {
                     let trimmed = dest.trim();
-                    if acceptable.contains(&trimmed) {
+
+                    if Self::is_valid(trimmed, rules) {
                         *dest = trimmed.to_string();
-                        break;
-                    } else {
-                        println!("Invalid input. Acceptable values are: {:?}", acceptable);
-                        print!("Try again: ");
+                        return;
                     }
+
+                    println!("Invalid input. Try again:");
+                    print!("> ");
                 }
+
                 Err(e) => {
-                    println!("Problematic input! {}", e);
-                    print!("Try again: ");
+                    println!("Error reading input: {}", e);
+                    print!("> ");
                 }
             }
         }
     }
 
-    fn handle_main_menu(&mut self, input: String) {
-        match input.as_str() {
-            "q" => {
-                self.screen = State::Exit;
-            }
-            _ => {
-
+    fn is_valid(input: &str, rules: &[InputRule<'_>]) -> bool {
+        for rule in rules {
+            match rule {
+                InputRule::AcceptStrings(list) => {
+                    if list.contains(&input) {
+                        return true;
+                    }
+                }
+                InputRule::AcceptNumberRange { low, high } => {
+                    if let Ok(n) = input.parse::<usize>() {
+                        if (*low..=*high).contains(&n) {
+                            return true;
+                        }
+                    }
+                }
+                InputRule::Custom(func) => {
+                    if func(input) {
+                        return true;
+                    }
+                }
             }
         }
+
+        false
     }
 }
