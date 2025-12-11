@@ -1,0 +1,31 @@
+CREATE TABLE awormap_items (
+    item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shopping_list_id TEXT NOT NULL,
+    item_name TEXT NOT NULL,
+
+    -- LWWReg fields
+    acquired_val INTEGER NOT NULL,
+    acquired_clock INTEGER NOT NULL,
+    acquired_actor TEXT NOT NULL,
+
+    -- References to the two GCounters
+    p_gcounter_id INTEGER NOT NULL,
+    n_gcounter_id INTEGER NOT NULL,
+
+    FOREIGN KEY(p_gcounter_id) REFERENCES gcounter(id),
+    FOREIGN KEY(n_gcounter_id) REFERENCES gcounter(id),
+    UNIQUE (shopping_list_id, item_name)
+);
+
+CREATE TABLE gcounter (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_actor TEXT NOT NULL  -- GCounter.id in your struct
+);
+
+CREATE TABLE gcounter_actor_values (
+    gcounter_id INTEGER NOT NULL,
+    actor_id TEXT NOT NULL,
+    value INTEGER NOT NULL,
+    PRIMARY KEY (gcounter_id, actor_id),
+    FOREIGN KEY (gcounter_id) REFERENCES gcounter(id)
+);
