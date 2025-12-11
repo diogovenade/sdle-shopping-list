@@ -1,6 +1,6 @@
-use anyhow::{Result};
+use anyhow::Result;
 use uuid::Uuid;
-use zmq::{Context, Error, Socket, SocketType};
+use zmq::{Context, Error, SNDMORE, Socket, SocketType};
 
 use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
@@ -49,13 +49,9 @@ what i think server needs:
     (store this somewehere in metadata, maybe proxy can be aware of this and identify/keep track for each
     hash key space the fastest node)
  */
-// A minimal Harmony-pattern ZMQ peer with membership + gossip
-// This is intentionally simplified for demonstration purposes.
-
 
 const GOSSIP_INTERVAL: u64 = 500;
-
-
+const JOIN_TIMEOUT: u64 = 1500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<String, String>);
@@ -63,30 +59,37 @@ pub struct MembershipTable(pub HashMap<String, String>);
 // so p nao ter q usar self.0 :p
 impl MembershipTable {
     pub fn insert(&mut self, uuid: String, addr: String) {
-        self.0.insert(
-            uuid.clone(),
-            addr
-        );
+        self.0.insert(uuid, addr);
     }
 }
 
 // TODO: mudar isto para message.rs, pensar em mais mensagens
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
-    OHAI { uuid: String, addr: String },
+    HELLO { uuid: String, addr: String },
     GOSSIP { table: MembershipTable },
-    PING { uuid: String },
+    PING,
     ACK,
+}
+
+impl Msg {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Msg::HELLO { .. } => "HELLO",
+            Msg::GOSSIP { .. } => "GOSSIP",
+            Msg::PING => "PING",
+            Msg::ACK => "ACK",
+        }
+    }
 }
 
 pub struct Peer {
     addr: String,
     uuid: String,
     ctx: Context,
-    router: Socket,                   // for incoming messages
-    membership: MembershipTable,      // stores known addresses
-    // dealers: HashMap<String, Socket>  // store open sockets, maybe not -> return socket close it later
-    // eventualmente hashring
+    router: Socket, // for incoming messages
+    membership: MembershipTable, // stores known addresses
+    // TODO: missing hashring 
 }
 
 pub type SharedPeer = Arc<Mutex<Peer>>;
@@ -101,10 +104,7 @@ impl Peer {
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
-        membership.0.insert(
-            uuid.to_string(),
-            bind_addr.to_string()
-        );
+        membership.0.insert(uuid.to_string(), bind_addr.to_string());
 
         anyhow::Ok(Self {
             ctx,
@@ -125,7 +125,8 @@ impl Peer {
         };
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
-        dealer.set_identity(uuid.as_bytes());
+        
+        dealer.set_identity(self.uuid.as_bytes());
         dealer.connect(&peer_addr);
 
         // self.dealers.insert(uuid.to_string(), dealer);
@@ -137,16 +138,11 @@ impl Peer {
         let peer_addr = match self.membership.0.get(uuid) {
             Some(e) => e,
             None => {
-                anyhow::bail!("Cannot close connection to {uuid}: peer not found in membership table");
+                anyhow::bail!(
+                    "Cannot close connection to {uuid}: peer not found in membership table"
+                );
             }
         };
-
-        // let socket = match self.dealers.get(uuid) {
-        //     Some(s) => s,
-        //     None => {
-        //         anyhow::bail!("Cannot close connection to {uuid}: peer not found in dealers table");
-        //     }
-        // };
 
         socket.disconnect(&peer_addr)?;
 
@@ -158,12 +154,16 @@ impl Peer {
         // open socket
         let socket = self.connect_to_peer(&uuid)?;
 
+        // send empty frame first
+        let _ = socket.send("", zmq::SNDMORE);
+
         // send msg
         let data = serde_json::to_vec(msg)?;
-        socket.send(data, 0);
+        println!("[{}] Sending {:?} to {}", self.uuid, msg.name(), uuid);
+        socket.send(data, 0)?;
 
         // close socket
-        self.close_conn(&uuid, socket);
+        self.close_conn(&uuid, socket)?;
 
         anyhow::Ok(())
     }
@@ -175,9 +175,27 @@ impl Peer {
 
         let p = match peers.choose(&mut rand::rng()) {
             Some(p) => p,
-            None             => {
+            None => {
                 anyhow::bail!("error sending gossip: no peers");
             }
+        };
+
+        if p == &self.uuid {
+            // only other peers
+            return anyhow::Ok(());
+        }
+
+        self.send_to(p, &msg)?;
+
+        anyhow::Ok(())
+    }
+
+    fn send_gossip_to(&self, uuid: &str) -> Result<()> {
+        let table = self.membership.clone();
+        let msg = Msg::GOSSIP { table };
+        let p = match self.membership.0.get(uuid) {
+            Some(p) => p,
+            None => anyhow::bail!("Error sending gossip: {} not found", uuid),
         };
 
         self.send_to(p, &msg);
@@ -187,7 +205,7 @@ impl Peer {
 
     // por agora threads implementadas
     //   1) gossip p membership
-    //   2) listener 
+    //   2) listener
 
     fn gossip(peer: SharedPeer) {
         thread::spawn(move || {
@@ -198,7 +216,7 @@ impl Peer {
                         poisoned.into_inner()
                     });
 
-                    peer.send_gossip();
+                    let _ = peer.send_gossip();
                 }
 
                 thread::sleep(Duration::from_millis(GOSSIP_INTERVAL));
@@ -210,24 +228,24 @@ impl Peer {
         thread::spawn(move || {
             loop {
                 let mut peer = peer.lock().unwrap_or_else(|poisoned| {
-                        eprintln!("Mutex poisoned");
-                        poisoned.into_inner()
+                    eprintln!("Mutex poisoned");
+                    poisoned.into_inner()
                 });
-                
+
                 let identity = match peer.router.recv_msg(zmq::DONTWAIT) {
                     Ok(msg) => msg,
                     Err(e) if e == zmq::Error::EAGAIN => {
                         // DEALER-ROUTER specific error to allow async
-                        
+
                         drop(peer);
 
-                        // maybe adicionar isto no caso de nao haver mensagens mas prov e ma ideia 
-                        //   -> larga escala temos que estar a espera q servers estejam smp a 
+                        // maybe adicionar isto no caso de nao haver mensagens mas prov e ma ideia
+                        //   -> larga escala temos que estar a espera q servers estejam smp a
                         //      receber mensagens
                         // thread::sleep(Duration::from_millis(1));
 
                         continue;
-                    },
+                    }
                     Err(e) => {
                         eprintln!("Failed to receive identity {}", e);
                         continue;
@@ -266,114 +284,149 @@ impl Peer {
                     }
                 };
 
-                // falta chamar aqui o self.handle_incoming() pa dar parse a mensagens
-
+                let _ = peer.handle_incoming(sender_uuid, msg);
             }
         });
     }
 
+    pub fn start(peer: SharedPeer) {
+        let listen_peer = Arc::clone(&peer);
+        let gossip_peer = Arc::clone(&peer);
+
+        Self::listen(listen_peer);
+        Self::gossip(gossip_peer);
+    }
+
     pub fn ping(&mut self, uuid: &str) -> Result<()> {
-        let msg: Msg = Msg::PING { uuid: (self.uuid.clone()) };
+        let msg: Msg = Msg::PING;
 
         self.send_to(uuid, &msg)
     }
 
+    // dont have peer in membership table -> normal send_to/connect_peer dont work
+    pub fn join(&mut self, seed_addr: &str) -> Result<()> {
+        let socket = self.ctx.socket(SocketType::DEALER)?;
+        socket.set_identity(self.uuid.as_bytes())?;
+        socket.connect(seed_addr)?;
 
-    // TODO: update to match new implementation
-    pub fn join_cluster(&mut self, seed_addr: &str) -> Result<()> {
-        // create a temporary DEALER that is not inserted into self.dealers yet
-        let temp = self.ctx.socket(SocketType::DEALER)?;
-        temp.set_identity(self.uuid.as_bytes())?;
-        temp.connect(seed_addr)?;
-
-        // send OHAI to seed
-        let ohai = Msg::OHAI {
-            uuid: self.uuid.clone(),
-            addr: self.addr.clone(),
+        let hello = Msg::HELLO {
+            uuid: (self.uuid.clone()),
+            addr: (self.addr.clone()),
         };
-        let data = serde_json::to_vec(&ohai)?;
-        temp.send(data, 0)?;
 
-        println!("[{}] OHAI sent to {}", self.uuid, seed_addr);
+        // empty frame first
+        socket.send("", zmq::SNDMORE)?;
 
-        // wait for a GOSSIP reply (blocking, maybe not good but it is startup so maybe no prob)
+        // follow with data
+        let data = serde_json::to_vec(&hello)?;
+        socket.send(data, 0)?;
+
+        println!("sent HELLO to {}", seed_addr);
+
         let start = Instant::now();
-        let mut buf = None;
-        while start.elapsed() < Duration::from_secs(5) {
-            // try to recv with poll
-            let mut items = [temp.as_poll_item(zmq::POLLIN)];
-            zmq::poll(&mut items, 100)?;
-            if items[0].is_readable() {
-                let msg_bytes = temp.recv_bytes(0)?;
-                buf = Some(msg_bytes);
-                break;
-            }
+
+        // block until getting message
+        let mut buf: Option<Msg> = None;
+        while start.elapsed() < Duration::from_millis(JOIN_TIMEOUT) {
+            let identity = match self.router.recv_msg(zmq::DONTWAIT) {
+                Ok(msg) => msg,
+                Err(e) if e == zmq::Error::EAGAIN => {
+                    // DEALER-ROUTER specific error to allow async
+                    // eprintln!("No message received");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("Failed to receive identity {}", e);
+                    continue;
+                }
+            };
+
+            let _ = match self.router.recv_msg(0) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("Failed to receive empty frame {}", e);
+                    continue;
+                }
+            };
+
+            let data = match self.router.recv_msg(0) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    eprintln!("Failed to receive data frame {}", e);
+                    continue;
+                }
+            };
+
+            buf = match serde_json::from_slice(&data) {
+                Ok(msg) => Some(msg),
+                Err(e) => {
+                    eprintln!("Failed to parse message {} : {:?}", e, data);
+                    continue;
+                }
+            };
+
+            let sender_uuid = match identity.as_str() {
+                Some(m) => m,
+                None => {
+                    eprint!("Listen failed: no identity specified in request");
+                    continue;
+                }
+            };
         }
 
-        let buf = match buf {
-            Some(b) => b,
-            None => anyhow::bail!("timeout waiting welcome from seed"),
+        let msg: Msg = match buf {
+            Some(msg) => msg,
+            None => {
+                anyhow::bail!("No message received");
+            }
         };
 
-        let msg: Msg = serde_json::from_slice(&buf)?;
         match msg {
             Msg::GOSSIP { table } => {
                 self.membership = table.clone();
-
-                // connect to everyone in the table
-                for (peer_uuid, entry) in table.0 {
-                    if peer_uuid == self.uuid {
-                        continue;
-                    }
-
-                    let _ = self.connect_to_peer(&peer_uuid, &entry.addr);
-                }
             }
-            other => anyhow::bail!("expected GOSSIP welcome, got: {:?}", other),
+            other => anyhow::bail!("expected GOSSIP table, got {:?}", other),
         }
+
+        // println!("Received membership table from GOSSIP");
+        println!("Joined cluster successfully!");
+
+        socket.disconnect(seed_addr)?;
 
         anyhow::Ok(())
     }
 
-    // TODO: update to match new implementation
-    fn handle_incoming(&mut self, ident: &[u8], msg: Msg) -> Result<()> {
-        let sender_uuid = String::from_utf8_lossy(ident).to_string();
+    fn handle_incoming(&mut self, identity: &str, msg: Msg) -> Result<()> {
         match msg {
-            Msg::OHAI { uuid, addr } => {
-                println!("[{}] Got OHAI from {} @ {}", self.uuid, uuid, addr);
-                self.membership.add(uuid.clone(), addr.clone());
-
-                let new_socket = self.ctx.socket(SocketType::DEALER)?;
-                new_socket.bind();
-
-
-
-                // Send them our full membership table
-                self.send_to(
-                    &uuid,
-                    &Msg::GOSSIP {
-                        table: self.membership.clone(),
-                    },
-                )?;
-            }
-
             Msg::GOSSIP { table } => {
-                println!("[{}] GOSSIP from {}", self.uuid, sender_uuid);
-                for (u, entry) in table.0 {
-                    self.membership.0.entry(u.clone()).or_insert(entry);
+                println!("[{}] Received GOSSIP from {}", self.uuid, identity);
+                // update our table if it changed
+                for (u, addr) in table.0 {
+                    self.membership.insert(u, addr);
                 }
             }
 
-            Msg::PING { uuid } => {
-                println!("[{}] PING from {}", self.uuid, uuid);
-                self.send_to(&uuid, &Msg::ACK)?;
+            Msg::PING {} => {
+                println!("[{}] Received PING from {}", self.uuid, identity);
+                self.send_to(&identity, &Msg::ACK)?;
             }
 
             Msg::ACK => {
-                println!("[{}] ACK from {}", self.uuid, sender_uuid);
+                println!("[{}] Received ACK from {}", self.uuid, identity);
+            }
+
+            Msg::HELLO { uuid, addr } => {
+                println!("[{}] Received HELLO from {}", self.uuid, identity);
+                // update our table
+                self.membership.insert(uuid.clone(), addr);
+
+                // send gossip to new node
+                let _ = self.send_gossip_to(&uuid);
+
+                // send random gossip immediatelly
+                let _ = self.send_gossip();
             }
         }
         anyhow::Ok(())
     }
 }
-
