@@ -9,9 +9,6 @@ use std::{
     thread
 };
 
-mod client;
-mod server;
-
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
 }
