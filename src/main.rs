@@ -1,7 +1,8 @@
-use std::env;
+use anyhow::Result;
+use sdle::cli::ClientInterfaceManager;
 use sdle::client::Client;
 use sdle::server::Server;
-use anyhow::{Result};
+use std::env;
 use uuid::Uuid;
 
 fn print_usage() {
@@ -19,7 +20,14 @@ fn main() -> Result<()> {
     match run_opt.as_str() {
         "client" => {
             let mut client = Client::new()?;
-            // client.send_item_storage_request("apples".to_string(), 10, false, Uuid::new_v4())?;
+            
+            //NOTE: "I'm just here for testing, remove me if you want!" - this guy below
+            client.send_item_storage_request("apples".to_string(), 10, false, Uuid::new_v4())?;
+            
+            let mut client_interface = ClientInterfaceManager::new(client);
+            while !client_interface.is_done() {
+                client_interface.render();
+            }
         }
         "server" => {
             if let Err(e) = Server::setup_server() {

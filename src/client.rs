@@ -1,10 +1,34 @@
 use uuid::Uuid;
 use zmq::{Context, Error as zmqErr, SocketType};
 use crate::storage::{ClientStorage};
+use crate::crdt::{ShoppingList};
 use anyhow::Result;
+use std::collections::HashMap;
+
+pub struct ShoppingListInterface {
+    pub list_id: Uuid,
+    pub items: HashMap<String, (u64, bool)> // <name, (amount, acquired)>
+}
+
+impl ShoppingListInterface {
+    fn from_crdt(sl: &ShoppingList) -> Self {
+        let mut items = HashMap::new();
+        let map = &sl.list;
+        for (k, v) in map.items.iter() {
+            let name = k.clone();
+            let amount = v.amount.value_total() as u64;
+            let acquired: bool = v.acquired.val != 0; 
+            items.insert(name, (amount, acquired));
+        }
+        Self {
+            list_id: sl.id,
+            items: items,
+        }
+    }
+}
 
 pub struct Client {
-    id: Uuid,
+    pub id: Uuid,
     storage_handler: ClientStorage,
 }
 
@@ -15,6 +39,31 @@ impl Client {
             id: storage_handler.client_id,
             storage_handler,
         })
+    }
+
+    pub fn retrieve_available_lists(&self) -> Result<Option<Vec<ShoppingListInterface>>> {
+        let lists = self.storage_handler.get_user_lists()?;
+
+        match lists {
+            Some(vec) => {
+                let mut list_interface_vec: Vec<ShoppingListInterface> = Vec::new();
+                for list in vec {
+                    list_interface_vec.push(ShoppingListInterface::from_crdt(&list));
+                }
+                Ok(Some(list_interface_vec))
+            }
+            None => {
+                Ok(None)
+            }
+        }
+    }
+
+    pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
+        let list = self.storage_handler.read_shopping_list(list_id)?;
+
+        let list_interface = ShoppingListInterface::from_crdt(&list);
+
+        Ok(list_interface)
     }
 
     pub fn send_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) -> Result<()> {
