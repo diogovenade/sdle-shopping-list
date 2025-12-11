@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::storage::ServerStorage;
+
 /*
 what i think server needs:
   - *Sockets*: one DEALER for output and one ROUTER for input for each peer, this should ensure comms
@@ -84,11 +86,15 @@ impl Msg {
 }
 
 pub struct Peer {
-    addr: String,
     uuid: String,
+    storage: ServerStorage,
+    
+    // network related
+    addr: String,
     ctx: Context,
     router: Socket, // for incoming messages
     membership: MembershipTable, // stores known addresses
+    
     // TODO: missing hashring 
 }
 
@@ -106,12 +112,15 @@ impl Peer {
         let mut membership = MembershipTable(HashMap::new());
         membership.0.insert(uuid.to_string(), bind_addr.to_string());
 
+        let storage = ServerStorage::new(uuid)?;
+
         anyhow::Ok(Self {
             ctx,
             uuid: uuid.to_string(),
             router,
             membership,
             addr: bind_addr.to_string(),
+            storage
         })
     }
 
