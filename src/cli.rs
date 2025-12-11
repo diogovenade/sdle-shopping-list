@@ -44,6 +44,9 @@ impl ClientInterfaceManager {
                 println!("Logged in as client: {}", client_id.to_string());
                 let list_vec = self.print_lists();
                 println!("Commands: q - quit; <nr> - open list number <nr>; a - add new list;");
+                print!("> ");
+                io::stdout().flush().unwrap();
+
                 let mut input = String::new();
                 Self::read_validated_input(
                     &mut input,
@@ -58,7 +61,17 @@ impl ClientInterfaceManager {
                 self.handle_main_menu(input, &list_vec);
             }
             State::ListCreate(list_id) => {
+                print!("{}", CLEAR_SEQUENCE);
                 println!("You are editing a new list! Get started adding some items.");
+                println!("\nCommands: q - quit; b - back to menu; a - add new item;");
+                print!("> ");
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                Self::read_validated_input(&mut input, &[
+                    InputRule::AcceptStrings(&["q", "b", "a"])
+                ]);
+                self.handle_newlist_edit(input, list_id);
             }
             State::ListEdit(list_id) => {
                 println!("Loading...");
@@ -68,8 +81,11 @@ impl ClientInterfaceManager {
                     let items = Self::print_and_process_list_items(list);
 
                     println!("\nCommands: q - quit; b- back to menu; <nr> - edit item number <nr>; a - add new item;");
+                    print!("> ");
+                    io::stdout().flush().unwrap();
+
                     Self::read_validated_input(&mut input, &[
-                        InputRule::AcceptStrings(&["q", "b"]),
+                        InputRule::AcceptStrings(&["q", "b", "a"]),
                         InputRule::AcceptNumberRange { low: 1, high: items.len() },
                     ]);
                     self.handle_list_edit(input, &items, list_id);
@@ -82,7 +98,8 @@ impl ClientInterfaceManager {
             }
             State::ItemEdit(list_id, item) => {
                 println!("Editing item {}. a<nr> - change amount to <nr>; d - toggle acquired status; b - go back, doing nothing;", &item.name);
-                print!(">");
+                print!("> ");
+                io::stdout().flush().unwrap();
                 let mut input = String::new();
                 Self::read_validated_input(&mut input, &[
                     InputRule::AcceptStrings(&["q", "d", "b"]),
@@ -152,6 +169,37 @@ impl ClientInterfaceManager {
         }
     }
 
+    fn handle_newlist_edit(&mut self, input: String, list_id: Uuid) {
+        match input.as_str() {
+            "q" => {
+                self.screen = State::Exit;
+            }
+            "b" => {
+                self.screen = State::MainMenu;
+            }
+            "a" => {
+                let item = Self::build_item();
+
+                match self.client.send_item_storage_request(item.name, item.amount, item.acquired, list_id) {
+                    Ok(_) => {
+                        self.screen = State::ListEdit(list_id);
+                        return;
+                    }
+                    Err(e) => {
+                        println!("Error on item storage! {e}");
+                        io::stdout().flush().unwrap();
+                        let _ = io::stdin().read_line(&mut String::new());
+                        self.screen = State::ListCreate(list_id);
+                        return;
+                    }
+                }
+            }
+            other => {
+                println!("Unknown command: {}", other); //safeguard
+            }
+        }
+}
+
     fn handle_list_edit(&mut self, input: String, items: &Vec<ItemInterface>, list_id: Uuid) {
         match input.as_str() {
             "q" => {
@@ -165,7 +213,8 @@ impl ClientInterfaceManager {
 
                 match self.client.send_item_storage_request(item.name, item.amount, item.acquired, list_id) {
                     Ok(_) => {
-
+                        self.screen = State::ListEdit(list_id);
+                        return;
                     }
                     Err(e) => {
                         println!("Error on item storage! {e}");
@@ -175,8 +224,6 @@ impl ClientInterfaceManager {
                         return;
                     }
                 }
-                self.screen = State::ListEdit(list_id);
-                return;
             }
             "d" => {
                 todo!(); //TODO: implement item deletion
@@ -331,6 +378,7 @@ impl ClientInterfaceManager {
     fn build_item() -> ItemInterface {
         println!("Enter item name: ");
         print!("> ");
+        io::stdout().flush().unwrap();
         let mut name = String::new();
         Self::read_validated_input(&mut name, &[
             InputRule::Custom(Box::new(|s: &str | {
@@ -338,6 +386,9 @@ impl ClientInterfaceManager {
             }))
         ]);
         let mut amount_string = String::new();
+        println!("Enter item amount: ");
+        print!("> ");
+        io::stdout().flush().unwrap();
         Self::read_validated_input(&mut amount_string, &[
             InputRule::AcceptNumberRange { low: 1, high: UPPER_ITEM_COUNT_LIMIT }
         ]);
