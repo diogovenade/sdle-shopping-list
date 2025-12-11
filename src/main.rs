@@ -19,11 +19,7 @@ fn main() -> Result<()> {
 
     match run_opt.as_str() {
         "client" => {
-            let mut client = Client::new()?;
-            
-            //NOTE: "I'm just here for testing, remove me if you want!" - this guy below
-            client.send_item_storage_request("apples".to_string(), 10, false, Uuid::new_v4())?;
-            
+            let client = Client::new()?;
             let mut client_interface = ClientInterfaceManager::new(client);
             while !client_interface.is_done() {
                 client_interface.render();

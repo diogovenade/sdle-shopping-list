@@ -333,7 +333,7 @@ impl ClientStorage {
             "UPDATE awormap_items
                     SET acquired_val = ?1,
                         acquired_clock = ?2,
-                        acquired_actor = ?3,
+                        acquired_actor = ?3
                     WHERE item_id = ?4",
                     params![
                     item.acquired.val as i64,
