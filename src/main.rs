@@ -1,18 +1,13 @@
 use anyhow::Result;
 use sdle::cli::ClientInterfaceManager;
 use sdle::client::Client;
-use sdle::server::Server;
+use sdle::server::{Peer, SharedPeer};
 use std::env;
-use uuid::Uuid;
 use std::{
-    env,
     sync::{Arc, Mutex},
     time::Duration,
+    thread
 };
-
-use uuid::Uuid;
-
-use crate::server::{Peer, SharedPeer};
 
 mod client;
 mod server;
@@ -51,7 +46,7 @@ fn main() -> Result<()> {
             // start seed node first
             Peer::start(Arc::clone(&sp1));
 
-            std::thread::sleep(Duration::from_millis(100));
+            thread::sleep(Duration::from_millis(100));
 
             {
                 let mut g = sp2.lock().unwrap();
@@ -75,7 +70,7 @@ fn main() -> Result<()> {
             // to test -> peer 2 pings peer 3 every 2 seconds
             {
                 let sp2_clone = Arc::clone(&sp2);
-                std::thread::spawn(move || {
+                thread::spawn(move || {
                     loop {
                         {
                             let mut p2_guard = sp2_clone.lock().unwrap();
@@ -85,13 +80,13 @@ fn main() -> Result<()> {
                                 println!("[p2 -> p3] Ping sent");
                             }
                         }
-                        std::thread::sleep(Duration::from_secs(2));
+                        thread::sleep(Duration::from_secs(2));
                     }
                 });
             }
 
             loop {
-                std::thread::sleep(Duration::from_secs(1));
+                thread::sleep(Duration::from_secs(1));
             }
         }
         _ => {
