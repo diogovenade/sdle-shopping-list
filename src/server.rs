@@ -101,7 +101,6 @@ impl Peer {
         };
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
-
         let _ = dealer.set_identity(self.uuid.as_bytes());
         let _ = dealer.connect(&peer_addr);
 
@@ -296,6 +295,76 @@ impl Peer {
         });
     }
 
+    async fn listen_proxy(peer: SharedPeer) {
+        tokio::task::spawn_blocking(move || {
+            let dealer = &peer.dealer;
+            loop {
+                let dealer_guard = dealer.lock().unwrap();
+                let mut items = [dealer_guard.as_poll_item(zmq::POLLIN)];
+
+                match zmq::poll(&mut items, -1) {
+                    Ok(ready_count) if ready_count > 0 => {
+                        if items[0].is_readable() {
+                            // receive client_id frame
+                            let client_id_msg = match dealer_guard.recv_msg(zmq::DONTWAIT) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("[{}] Failed to receive client_id: {:?}", peer.uuid, e);
+                                    continue;
+                                }
+                            };
+
+                            // receive empty frame
+                            let _ = match dealer_guard.recv_msg(0) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("[{}] Failed to receive empty frame: {:?}", peer.uuid, e);
+                                    continue;
+                                }
+                            };
+
+                            // receive data frame
+                            let data_msg = match dealer_guard.recv_msg(0) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("[{}] Failed to receive data frame: {:?}", peer.uuid, e);
+                                    continue;
+                                }
+                            };
+
+                            let payload_str = std::str::from_utf8(&data_msg).ok();
+
+                            println!(
+                                "[{}] proxy: received request from client {} payload={:?}",
+                                peer.uuid,
+                                client_id_msg.as_str().unwrap_or("<binary>"),
+                                payload_str.unwrap_or("<binary>")
+                            );
+
+                            // TODO: parse/dispatch real client requests
+                            let reply = if let Some(s) = payload_str {
+                                format!("{}: ok ({})", peer.uuid, s).into_bytes()
+                            } else {
+                                format!("{}: ok ({} bytes)", peer.uuid, data_msg.len()).into_bytes()
+                            };
+
+                            let out_frames = vec![client_id_msg.to_vec(), Vec::new(), reply];
+
+                            if let Err(e) = dealer_guard.send_multipart(out_frames, 0) {
+                                eprintln!("[{}] send to proxy failed: {:?}", peer.uuid, e);
+                            }
+                        }
+                    }
+                    Ok(_) => continue, // no events
+                    Err(e) => {
+                        eprintln!("[{}] proxy poll error: {:?}", peer.uuid, e);
+                        continue;
+                    }
+                }
+            }
+        });
+    }
+
     pub async fn start(peer: SharedPeer) {
         let listen_peer = Arc::clone(&peer);
         tokio::spawn(async move {
@@ -305,6 +374,11 @@ impl Peer {
         let gossip_peer = Arc::clone(&peer);
         tokio::spawn(async move {
             Peer::gossip(gossip_peer).await;
+        });
+
+        let proxy_peer = Arc::clone(&peer);
+        tokio::spawn(async move {
+            Peer::listen_proxy(proxy_peer).await;
         });
 
         println!("[{}] Started successfully!", peer.uuid);
