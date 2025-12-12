@@ -1,6 +1,5 @@
 use anyhow::Result;
-use zmq::{Context, Socket, SocketType, Message, POLLIN};
-use std::collections::HashMap;
+use zmq::{Context, Socket, SocketType, POLLIN};
 
 pub struct Proxy {
     context: Context,
@@ -26,6 +25,8 @@ impl Proxy {
     }
 
     pub fn start(&self) -> Result<()> {
+        let target_server_id = "peer1".to_string(); // apenas para testar, depois mudar com lógica do hash ring
+
         let mut items = [
             self.frontend.as_poll_item(POLLIN),
             self.backend.as_poll_item(POLLIN),
@@ -36,17 +37,25 @@ impl Proxy {
 
             // Client -> Server
             if items[0].is_readable() {
-                let msg = self.frontend.recv_multipart(0)?;
+                let mut msg = self.frontend.recv_multipart(0)?;
                 // TODO: Use consistent hashing to pick server identity
-                // let server_id = hash_ring.get_coordinator(&request_key);
+                // algo como -> let server_id = hash_ring.get_coordinator(&request_key);
                 // Prepend server identity to msg and send to backend
+
+                // msg is typically: [client_id][empty][payload]
+                // Backend ROUTER requires: [server_id][client_id][empty][payload]
+                msg.insert(0, target_server_id.as_bytes().to_vec());
                 self.backend.send_multipart(msg, 0)?;
             }
 
             // Server -> Client
             if items[1].is_readable() {
-                let msg = self.backend.recv_multipart(0)?;
-                // Forward to client
+                let mut msg = self.backend.recv_multipart(0)?;
+                // msg is typically: [server_id][client_id][empty][payload]
+                // Frontend ROUTER expects: [client_id][empty][payload]
+                if !msg.is_empty() {
+                    msg.remove(0); // drop server_id routing frame
+                }
                 self.frontend.send_multipart(msg, 0)?;
             }
         }

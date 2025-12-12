@@ -11,7 +11,7 @@ use std::{
 };
 
 fn print_usage() {
-    eprintln!("Usage: cargo run <client|server|proxy>");
+    eprintln!("Usage: cargo run <client|server|proxy|client-test>");
 }
 
 #[tokio::main(flavor="multi_thread")]
@@ -88,6 +88,10 @@ async fn main() -> Result<()> {
             let proxy = Proxy::new(frontend_addr, backend_addr)?;
             println!("Proxy running: frontend at {}, backend at {}", frontend_addr, backend_addr);
             proxy.start()?;
+        }
+        "client-test" => {
+            let client = Client::new()?;
+            client.connect()?;
         }
         _ => {
             print_usage();
