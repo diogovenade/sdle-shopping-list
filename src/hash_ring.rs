@@ -2,6 +2,9 @@ use md5::{Digest, Md5};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
+pub const VNODES: usize = 3;
+pub const REPLICAS: usize = 3;
+
 pub struct HashRing {
     ring: BTreeMap<u128, Uuid>, // hash -> server_id
     virtual_nodes: usize,       // partitioning
