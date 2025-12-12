@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::storage::ServerStorage;
 
+use crate::crdt::{ShoppingList, Mergeable};
+
 /*
 what i think server needs:
   - *Sockets*: one DEALER for output and one ROUTER for input for each peer, this should ensure comms
@@ -73,6 +75,11 @@ pub enum Msg {
     GOSSIP { table: MembershipTable },
     PING,
     ACK,
+    // Shopping list operations
+    GET_LIST { list_id: Uuid },
+    PUT_LIST { list: ShoppingList },
+    MERGE_LIST { list: ShoppingList },
+    LIST_RESPONSE { list: Option<ShoppingList> },
 }
 
 impl Msg {
@@ -82,6 +89,10 @@ impl Msg {
             Msg::GOSSIP { .. } => "GOSSIP",
             Msg::PING => "PING",
             Msg::ACK => "ACK",
+            Msg::GET_LIST { .. } => "GET_LIST",
+            Msg::PUT_LIST { .. } => "PUT_LIST",
+            Msg::MERGE_LIST { .. } => "MERGE_LIST",
+            Msg::LIST_RESPONSE { .. } => "LIST_RESPONSE",
         }
     }
 }
@@ -493,6 +504,47 @@ impl Peer {
 
                 // send random gossip immediatelly
                 let _ = self.send_gossip();
+            }
+
+            Msg::GET_LIST { list_id } => {
+                println!("[{}] Received GET_LIST for {} from {}", self.uuid, list_id, identity);
+                let list = {
+                    let storage = self.storage.lock().unwrap();
+                    storage.get_shopping_list(&list_id)?
+                };
+
+                let response = Msg::LIST_RESPONSE { list };
+                self.send_to(identity, &response)?;
+            }
+
+            Msg::PUT_LIST { list } => {
+                println!("[{}] Received PUT_LIST for {} from {}", self.uuid, list.id, identity);
+                let mut storage = self.storage.lock().unwrap();
+                storage.write_shopping_list(&list)?;
+                println!("[{}] Stored shopping list {}", self.uuid, list.id);
+            }
+
+            Msg::MERGE_LIST { list } => {
+                println!("[{}] Received MERGE_LIST for {} from {}", self.uuid, list.id, identity);
+                let mut storage = self.storage.lock().unwrap();
+                
+                match storage.get_shopping_list(&list.id)? {
+                    Some(mut existing) => {
+                        existing.list.merge(&list.list);
+                        storage.write_shopping_list(&existing)?;
+                        println!("[{}] Merged shopping list {}", self.uuid, list.id);
+                    }
+                    None => {
+                        // no existing list, just store it
+                        storage.write_shopping_list(&list)?;
+                        println!("[{}] Stored new shopping list {} (no existing to merge)", self.uuid, list.id);
+                    }
+                }
+            }
+
+            Msg::LIST_RESPONSE { .. } => {
+                println!("[{}] Received LIST_RESPONSE from {}", self.uuid, identity);
+                // responses are typically handled by the requester?
             }
         }
         anyhow::Ok(())
