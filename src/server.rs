@@ -13,53 +13,12 @@ use std::time::{Duration, Instant};
 
 use crate::storage::ServerStorage;
 
-/*
-what i think server needs:
-  - *Sockets*: one DEALER for output and one ROUTER for input for each peer, this should ensure comms
-    with every peer.
-
-  - *Discovery*: there must be a _seed_ node which address is known to allow for new nodes to join, but
-    to starts comms its is a bit harder -> must create sockets for each known address (known by the seed
-    node!)
-
-  - *Membership*: there must be some kind of table to keep track of membership (maybe crdt)
-
-  - *Gossip*: a simple gossip protocol must be used to ensure membership is known across server nodes ->
-    each T seconds choose a random known node and send them own membership table, node then updates its
-    own table and repeats. On node JOIN, seed node sends to new node its membership table and start gossip
-    immeadiately.
-
-  - *DBs*: following Amazon Dynamo paper, two DBs used. One to store server data, this being CRDTs with
-    shopping lists info. The second used to store data from a _hinted handoff_. (maybe good idea to save
-    membership, maybe not if it comes from failure detection)
-
-  - *Hinted Handoff*: happens when a node can't save a replica's data, then coordinator sends to another
-    node (node_i + N) and in its metadata includes a reference to the node which failed. this is stored in
-    the DB to later be sent back to the node.
-
-  - *Permanent failure* / *Replica sync*: ainda nao vi mas tem algo a ver com merkle trees ainda nao percebi
-    se precisamos pq estamos a usar CRDTs, mas provavelemnte sim (tp dar schedule a um merge entre replicas
-    caso uma morra)
-
-  - *Failure Detection*: local failure detection, if node A ---send m---> node B and node B doesn't answer
-    in T seconds, A may consider B failed and reroute. A should then periodically retry node B to check for
-    recovery (maybe mandar membership??)
-
-  - *Coordinator*: a coordinator node is responsible for the hash key space between itself and last node on
-    the ring. it must execute write/read operations on nodes in this space. This involves collecting and
-    storing on its own DB as well as in the replica nodes (N nodes). This may cause uneven load. So coordinator
-    can be any of the top N nodes in the preference list -> the who replied faster to the last read request
-    (store this somewehere in metadata, maybe proxy can be aware of this and identify/keep track for each
-    hash key space the fastest node)
- */
-
 const GOSSIP_INTERVAL: u64 = 500;
 const JOIN_TIMEOUT: u64 = 1500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<String, String>);
 
-// so p nao ter q usar self.0 :p
 impl MembershipTable {
     pub fn insert(&mut self, uuid: String, addr: String) {
         self.0.insert(uuid, addr);
@@ -109,7 +68,7 @@ impl Peer {
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
-        membership.0.insert(uuid.to_string(), bind_addr.to_string());
+        membership.insert(uuid.to_string(), bind_addr.to_string());
 
         let storage = ServerStorage::new(uuid)?;
 
@@ -137,8 +96,8 @@ impl Peer {
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
 
-        dealer.set_identity(self.uuid.as_bytes());
-        dealer.connect(&peer_addr);
+        let _ = dealer.set_identity(self.uuid.as_bytes());
+        let _ = dealer.connect(&peer_addr);
 
         // self.dealers.insert(uuid.to_string(), dealer);
 

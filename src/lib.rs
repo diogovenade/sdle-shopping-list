@@ -5,3 +5,4 @@ mod crdt;
 mod hash_ring;
 mod message;
 pub mod server;
+pub mod proxy;
