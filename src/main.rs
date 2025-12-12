@@ -2,6 +2,7 @@ use anyhow::Result;
 use sdle::cli::ClientInterfaceManager;
 use sdle::client::Client;
 use sdle::server::{Peer, SharedPeer};
+use uuid::Uuid;
 use std::env;
 use std::{
     sync::{Arc, Mutex},
@@ -33,9 +34,9 @@ async fn main() -> Result<()> {
         "server" => {
             let seed_addr = "tcp://127.0.0.1:6000";
 
-            let p1 = Peer::new("peer1", &seed_addr)?;
-            let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001")?;
-            let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002")?;
+            let p1 = Peer::new(Uuid::new_v4(), &seed_addr)?;
+            let p2 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6001")?;
+            let p3 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6002")?;
 
             let sp1: SharedPeer = Arc::new(p1);
             let sp2: SharedPeer = Arc::new(p2);
