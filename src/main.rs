@@ -32,10 +32,11 @@ async fn main() -> Result<()> {
         }
         "server" => {
             let seed_addr = "tcp://127.0.0.1:6000";
+            let proxy_backend = "tcp://127.0.0.1:5556";
 
-            let p1 = Peer::new("peer1", &seed_addr)?;
-            let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001")?;
-            let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002")?;
+            let p1 = Peer::new("peer1", &seed_addr, &proxy_backend)?;
+            let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001", &proxy_backend)?;
+            let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002", &proxy_backend)?;
 
             let sp1: SharedPeer = Arc::new(p1);
             let sp2: SharedPeer = Arc::new(p2);

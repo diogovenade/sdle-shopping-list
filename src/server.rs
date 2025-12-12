@@ -53,18 +53,23 @@ pub struct Peer {
     addr: String,
     ctx: Context,
     router: Mutex<Socket>,              // for incoming messages
+    dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
 }
 
 pub type SharedPeer = Arc<Peer>;
 
 impl Peer {
-    pub fn new(uuid: &str, bind_addr: &str) -> Result<Self> {
+    pub fn new(uuid: &str, bind_addr: &str, proxy_addr: &str) -> Result<Self> {
         let ctx = Context::new();
 
         let router = ctx.socket(SocketType::ROUTER)?;
         // router.set_identity(uuid.as_bytes())?; // ROUTER socket identity -> not important, router is the one who needs to know the requests identity
         router.bind(bind_addr)?;
+
+        let dealer = ctx.socket(SocketType::DEALER)?;
+        dealer.set_identity(uuid.as_bytes())?;
+        dealer.connect(proxy_addr)?;
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
@@ -76,6 +81,7 @@ impl Peer {
             ctx,
             uuid: uuid.to_string(),
             router: Mutex::new(router),
+            dealer: Mutex::new(dealer),
             membership: Mutex::new(membership),
             addr: bind_addr.to_string(),
             storage: Mutex::new(storage),
