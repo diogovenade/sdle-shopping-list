@@ -1,6 +1,7 @@
 use anyhow::Result;
 use sdle::cli::ClientInterfaceManager;
 use sdle::client::Client;
+use sdle::proxy::Proxy;
 use sdle::server::{Peer, SharedPeer};
 use std::env;
 use std::{
@@ -10,7 +11,7 @@ use std::{
 };
 
 fn print_usage() {
-    eprintln!("Usage: cargo run <client|server>");
+    eprintln!("Usage: cargo run <client|server|proxy>");
 }
 
 #[tokio::main(flavor="multi_thread")]
@@ -80,6 +81,13 @@ async fn main() -> Result<()> {
             loop {
                 thread::sleep(Duration::from_secs(1));
             }
+        },
+        "proxy" => {
+            let frontend_addr = "tcp://127.0.0.1:5555";
+            let backend_addr = "tcp://127.0.0.1:5556";
+            let proxy = Proxy::new(frontend_addr, backend_addr)?;
+            println!("Proxy running: frontend at {}, backend at {}", frontend_addr, backend_addr);
+            proxy.start()?;
         }
         _ => {
             print_usage();
