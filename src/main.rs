@@ -13,7 +13,8 @@ fn print_usage() {
     eprintln!("Usage: cargo run <client|server>");
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor="multi_thread")]
+async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
     let Some(run_opt) = args.get(1) else {
@@ -36,51 +37,44 @@ fn main() -> Result<()> {
             let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001")?;
             let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002")?;
 
-            let sp1: SharedPeer = Arc::new(Mutex::new(p1));
-            let sp2: SharedPeer = Arc::new(Mutex::new(p2));
-            let sp3: SharedPeer = Arc::new(Mutex::new(p3));
+            let sp1: SharedPeer = Arc::new(p1);
+            let sp2: SharedPeer = Arc::new(p2);
+            let sp3: SharedPeer = Arc::new(p3);
 
             // start seed node first
-            Peer::start(Arc::clone(&sp1));
+            Peer::start(Arc::clone(&sp1)).await;
 
             thread::sleep(Duration::from_millis(100));
 
-            {
-                let mut g = sp2.lock().unwrap();
-                match g.join(seed_addr) {
-                    Ok(_) => {},
-                    Err(e) => eprintln!("Peer 2 failed to join: {}", e),
-                }
+            if let Err(e) = sp2.join(&seed_addr) {
+                eprintln!("{} failed to join: {}", sp2.uuid, e);
             }
 
-            {
-                let mut g = sp3.lock().unwrap();
-                match g.join(seed_addr) {
-                    Ok(_) => {},
-                    Err(e) => eprintln!("Peer 3 failed to join: {}", e),
-                }
+            if let Err(e) = sp3.join(&seed_addr) {
+                eprintln!("{} failed to join: {}", sp3.uuid, e);
             }
 
-            Peer::start(Arc::clone(&sp2));
-            Peer::start(Arc::clone(&sp3));
+
+            Peer::start(Arc::clone(&sp2)).await;
+            Peer::start(Arc::clone(&sp3)).await;
 
             // to test -> peer 2 pings peer 3 every 2 seconds
-            {
-                let sp2_clone = Arc::clone(&sp2);
-                thread::spawn(move || {
-                    loop {
-                        {
-                            let mut p2_guard = sp2_clone.lock().unwrap();
-                            if let Err(e) = p2_guard.ping("peer3") {
-                                eprintln!("[p2 -> p3] Ping failed: {}", e);
-                            } else {
-                                println!("[p2 -> p3] Ping sent");
-                            }
-                        }
-                        thread::sleep(Duration::from_secs(2));
-                    }
-                });
-            }
+            // {
+            //     let sp2_clone = Arc::clone(&sp2);
+            //     thread::spawn(move || {
+            //         loop {
+            //             {
+            //                 let mut p2_guard = sp2_clone.lock().unwrap();
+            //                 if let Err(e) = p2_guard.ping("peer3") {
+            //                     eprintln!("[p2 -> p3] Ping failed: {}", e);
+            //                 } else {
+            //                     println!("[p2 -> p3] Ping sent");
+            //                 }
+            //             }
+            //             thread::sleep(Duration::from_secs(2));
+            //         }
+            //     });
+            // }
 
             loop {
                 thread::sleep(Duration::from_secs(1));

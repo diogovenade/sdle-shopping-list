@@ -1,6 +1,7 @@
 use anyhow::Result;
+use tokio::time::sleep;
 use uuid::Uuid;
-use zmq::{Context, Error, SNDMORE, Socket, SocketType};
+use zmq::{Context, Error, PollItem, SNDMORE, Socket, SocketType};
 
 use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
@@ -86,19 +87,17 @@ impl Msg {
 }
 
 pub struct Peer {
-    uuid: String,
-    storage: ServerStorage,
-    
+    pub uuid: String,
+    storage: Mutex<ServerStorage>,
+
     // network related
     addr: String,
     ctx: Context,
-    router: Socket, // for incoming messages
-    membership: MembershipTable, // stores known addresses
-    
-    // TODO: missing hashring 
+    router: Mutex<Socket>,              // for incoming messages
+    membership: Mutex<MembershipTable>, // stores known addresses
 }
 
-pub type SharedPeer = Arc<Mutex<Peer>>;
+pub type SharedPeer = Arc<Peer>;
 
 impl Peer {
     pub fn new(uuid: &str, bind_addr: &str) -> Result<Self> {
@@ -117,24 +116,27 @@ impl Peer {
         anyhow::Ok(Self {
             ctx,
             uuid: uuid.to_string(),
-            router,
-            membership,
+            router: Mutex::new(router),
+            membership: Mutex::new(membership),
             addr: bind_addr.to_string(),
-            storage
+            storage: Mutex::new(storage),
         })
     }
 
     // open socket connection to peer
     fn connect_to_peer(&self, uuid: &str) -> Result<Socket> {
-        let peer_addr = match self.membership.0.get(uuid) {
-            Some(e) => e,
-            None => {
-                anyhow::bail!("Cannot connect to {uuid}: peer not found in membership table");
+        let peer_addr = {
+            let table = self.membership.lock().unwrap();
+            match table.0.get(uuid) {
+                Some(e) => e.clone(),
+                None => {
+                    anyhow::bail!("Cannot connect to {uuid}: peer not found in membership table")
+                }
             }
         };
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
-        
+
         dealer.set_identity(self.uuid.as_bytes());
         dealer.connect(&peer_addr);
 
@@ -144,12 +146,15 @@ impl Peer {
     }
 
     fn close_conn(&self, uuid: &str, socket: Socket) -> Result<()> {
-        let peer_addr = match self.membership.0.get(uuid) {
-            Some(e) => e,
-            None => {
-                anyhow::bail!(
-                    "Cannot close connection to {uuid}: peer not found in membership table"
-                );
+        let peer_addr = {
+            let table = self.membership.lock().unwrap();
+            match table.0.get(uuid) {
+                Some(e) => e.clone(),
+                None => {
+                    anyhow::bail!(
+                        "Cannot close connection to {uuid}: peer not found in membership table"
+                    );
+                }
             }
         };
 
@@ -178,36 +183,54 @@ impl Peer {
     }
 
     fn send_gossip(&self) -> Result<()> {
-        let table = self.membership.clone();
+        let table = {
+            let table = self.membership.lock().unwrap();
+            table.clone()
+        };
+
         let msg = Msg::GOSSIP { table };
-        let peers: Vec<String> = self.membership.0.keys().cloned().collect();
+
+        let peers: Vec<String> = {
+            let table = self.membership.lock().unwrap();
+            table.0.keys().cloned().collect()
+        };
 
         let p = match peers.choose(&mut rand::rng()) {
-            Some(p) => p,
+            Some(p) => p.clone(),
             None => {
-                anyhow::bail!("error sending gossip: no peers");
+                anyhow::bail!("no peers");
             }
         };
 
-        if p == &self.uuid {
+        if p == self.uuid {
             // only other peers
             return anyhow::Ok(());
         }
 
-        self.send_to(p, &msg)?;
+        self.send_to(&p, &msg)?;
 
         anyhow::Ok(())
     }
 
     fn send_gossip_to(&self, uuid: &str) -> Result<()> {
-        let table = self.membership.clone();
-        let msg = Msg::GOSSIP { table };
-        let p = match self.membership.0.get(uuid) {
-            Some(p) => p,
-            None => anyhow::bail!("Error sending gossip: {} not found", uuid),
+        // ensure the peer exists
+        {
+            let table = self.membership.lock().unwrap();
+            if !table.0.contains_key(uuid) {
+                anyhow::bail!("{} not found", uuid);
+            }
+        }
+
+        let table_snapshot = {
+            let table = self.membership.lock().unwrap();
+            table.clone()
         };
 
-        self.send_to(p, &msg);
+        let msg = Msg::GOSSIP {
+            table: table_snapshot,
+        };
+
+        self.send_to(uuid, &msg)?;
 
         anyhow::Ok(())
     }
@@ -216,94 +239,110 @@ impl Peer {
     //   1) gossip p membership
     //   2) listener
 
-    fn gossip(peer: SharedPeer) {
-        thread::spawn(move || {
-            loop {
-                {
-                    let peer = peer.lock().unwrap_or_else(|poisoned| {
-                        eprintln!("Mutex poisoned");
-                        poisoned.into_inner()
-                    });
+    async fn gossip(peer: SharedPeer) {
+        let interval = Duration::from_millis(GOSSIP_INTERVAL);
 
-                    let _ = peer.send_gossip();
+        loop {
+            sleep(interval).await;
+            let peer_clone = Arc::clone(&peer);
+            let result = tokio::task::spawn_blocking(move || peer_clone.send_gossip()).await;
+
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => eprintln!("Gossip failed: {:?}", e),
+                Err(e) => eprintln!("Blocking task failed to execute: {:?}", e),
+            }
+        }
+    }
+
+    async fn listen(peer: SharedPeer) {
+        tokio::task::spawn_blocking(move || {
+            let router = &peer.router;
+
+            loop {
+                let router_guard = router.lock().unwrap();
+                let mut items = [router_guard.as_poll_item(zmq::POLLIN)];
+
+                match zmq::poll(&mut items, -1) {
+                    Ok(ready_count) if ready_count > 0 => {
+                        if items[0].is_readable() {
+                            // receive identity frame
+                            let identity_msg = match router_guard.recv_msg(zmq::DONTWAIT) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("Failed to receive identity: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            // receive empty frame
+                            let _ = match router_guard.recv_msg(0) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("Failed to receive empty frame: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            // receive data frame
+                            let data_msg = match router_guard.recv_msg(0) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("Failed to receive data frame: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            let msg: Msg = match serde_json::from_slice(&data_msg) {
+                                Ok(msg) => msg,
+                                Err(e) => {
+                                    eprintln!("Failed to parse message: {:?}", e);
+                                    continue;
+                                }
+                            };
+
+                            // spawn new thread for concurrent message handling
+                            let peer_clone = Arc::clone(&peer);
+                            tokio::spawn(async move {
+                                let sender_uuid = match identity_msg.as_str() {
+                                    Some(id) => id,
+                                    None => {
+                                        eprintln!("Identity frame invalid");
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) = peer_clone.handle_incoming(&sender_uuid, msg) {
+                                    eprintln!(
+                                        "Error handling message from {}: {:?}",
+                                        sender_uuid, e
+                                    );
+                                }
+                            });
+                        }
+                    }
+                    Ok(_) => continue, // no events
+                    Err(e) => {
+                        eprintln!("ZMQ poll error: {:?}", e);
+                        continue;
+                    }
                 }
-
-                thread::sleep(Duration::from_millis(GOSSIP_INTERVAL));
             }
         });
     }
 
-    fn listen(peer: SharedPeer) {
-        thread::spawn(move || {
-            loop {
-                let mut peer = peer.lock().unwrap_or_else(|poisoned| {
-                    eprintln!("Mutex poisoned");
-                    poisoned.into_inner()
-                });
-
-                let identity = match peer.router.recv_msg(zmq::DONTWAIT) {
-                    Ok(msg) => msg,
-                    Err(e) if e == zmq::Error::EAGAIN => {
-                        // DEALER-ROUTER specific error to allow async
-
-                        drop(peer);
-
-                        // maybe adicionar isto no caso de nao haver mensagens mas prov e ma ideia
-                        //   -> larga escala temos que estar a espera q servers estejam smp a
-                        //      receber mensagens
-                        // thread::sleep(Duration::from_millis(1));
-
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("Failed to receive identity {}", e);
-                        continue;
-                    }
-                };
-
-                let _ = match peer.router.recv_msg(0) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("Failed to receive empty frame {}", e);
-                        continue;
-                    }
-                };
-
-                let data = match peer.router.recv_msg(0) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("Failed to receive data frame {}", e);
-                        continue;
-                    }
-                };
-
-                let msg: Msg = match serde_json::from_slice(&data) {
-                    Ok(msg) => msg,
-                    Err(e) => {
-                        eprintln!("Failed to parse message {}", e);
-                        continue;
-                    }
-                };
-
-                let sender_uuid = match identity.as_str() {
-                    Some(m) => m,
-                    None => {
-                        eprint!("Listen failed: no identity specified in request");
-                        continue;
-                    }
-                };
-
-                let _ = peer.handle_incoming(sender_uuid, msg);
-            }
-        });
-    }
-
-    pub fn start(peer: SharedPeer) {
+    pub async fn start(peer: SharedPeer) {
         let listen_peer = Arc::clone(&peer);
-        let gossip_peer = Arc::clone(&peer);
+        tokio::spawn(async move {
+            Peer::listen(listen_peer).await;
+        });
 
-        Self::listen(listen_peer);
-        Self::gossip(gossip_peer);
+        let gossip_peer = Arc::clone(&peer);
+        tokio::spawn(async move {
+            Peer::gossip(gossip_peer).await;
+        });
+
+        println!("[{}] Started successfully!", peer.uuid);
     }
 
     pub fn ping(&mut self, uuid: &str) -> Result<()> {
@@ -313,7 +352,7 @@ impl Peer {
     }
 
     // dont have peer in membership table -> normal send_to/connect_peer dont work
-    pub fn join(&mut self, seed_addr: &str) -> Result<()> {
+    pub fn join(&self, seed_addr: &str) -> Result<()> {
         let socket = self.ctx.socket(SocketType::DEALER)?;
         socket.set_identity(self.uuid.as_bytes())?;
         socket.connect(seed_addr)?;
@@ -330,14 +369,17 @@ impl Peer {
         let data = serde_json::to_vec(&hello)?;
         socket.send(data, 0)?;
 
-        println!("sent HELLO to {}", seed_addr);
+        println!("[{}] Sent HELLO to {}", self.uuid, seed_addr);
 
         let start = Instant::now();
 
         // block until getting message
         let mut buf: Option<Msg> = None;
         while start.elapsed() < Duration::from_millis(JOIN_TIMEOUT) {
-            let identity = match self.router.recv_msg(zmq::DONTWAIT) {
+            // TODO: remover unwrap
+            let router = self.router.lock().unwrap();
+
+            let identity = match router.recv_msg(zmq::DONTWAIT) {
                 Ok(msg) => msg,
                 Err(e) if e == zmq::Error::EAGAIN => {
                     // DEALER-ROUTER specific error to allow async
@@ -350,7 +392,7 @@ impl Peer {
                 }
             };
 
-            let _ = match self.router.recv_msg(0) {
+            let _ = match router.recv_msg(0) {
                 Ok(msg) => msg,
                 Err(e) => {
                     eprintln!("Failed to receive empty frame {}", e);
@@ -358,7 +400,7 @@ impl Peer {
                 }
             };
 
-            let data = match self.router.recv_msg(0) {
+            let data = match router.recv_msg(0) {
                 Ok(msg) => msg,
                 Err(e) => {
                     eprintln!("Failed to receive data frame {}", e);
@@ -392,26 +434,29 @@ impl Peer {
 
         match msg {
             Msg::GOSSIP { table } => {
-                self.membership = table.clone();
+                let mut membership = self.membership.lock().unwrap();
+                *membership = table;
             }
             other => anyhow::bail!("expected GOSSIP table, got {:?}", other),
         }
 
         // println!("Received membership table from GOSSIP");
-        println!("Joined cluster successfully!");
+        println!("[{}] Joined cluster successfully!", self.uuid);
 
         socket.disconnect(seed_addr)?;
 
         anyhow::Ok(())
     }
 
-    fn handle_incoming(&mut self, identity: &str, msg: Msg) -> Result<()> {
+    fn handle_incoming(&self, identity: &str, msg: Msg) -> Result<()> {
         match msg {
             Msg::GOSSIP { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
                 // update our table if it changed
+                let mut membership_guard = self.membership.lock().unwrap();
+
                 for (u, addr) in table.0 {
-                    self.membership.insert(u, addr);
+                    membership_guard.insert(u, addr);
                 }
             }
 
@@ -426,11 +471,25 @@ impl Peer {
 
             Msg::HELLO { uuid, addr } => {
                 println!("[{}] Received HELLO from {}", self.uuid, identity);
-                // update our table
-                self.membership.insert(uuid.clone(), addr);
+
+                {
+                    // fazer operaçoes com locks dentro de brackets para ter a certeza q lock é solto 
+
+                    let mut membership_guard = self.membership.lock().unwrap();
+
+                    membership_guard.insert(uuid.clone(), addr);
+                }
+
+                println!(
+                    "[{}] Updated membership table: added {}",
+                    self.uuid, identity
+                );
 
                 // send gossip to new node
-                let _ = self.send_gossip_to(&uuid);
+                match self.send_gossip_to(&uuid) {
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[{}] Error sending gossip: {}", self.uuid, e),
+                }
 
                 // send random gossip immediatelly
                 let _ = self.send_gossip();
