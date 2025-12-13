@@ -79,10 +79,10 @@ impl Client {
     }
 
     pub fn connect(&self) -> Result<(), zmqErr> {
-        println!("Connecting to server...");
+        println!("Connecting to proxy frontend...");
         let context = Context::new();
         let requester = context.socket(SocketType::REQ)?;
-        let _ = requester.connect("tcp://localhost:5555");
+        let _ = requester.connect("tcp://127.0.0.1:5555");
 
         for request in 1..11 {
             println!("Sending hello... {}", request);

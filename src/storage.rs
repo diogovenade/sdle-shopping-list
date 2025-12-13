@@ -576,7 +576,7 @@ impl ServerStorage {
         Ok(())
     }
 
-    fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
+    pub fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
 
         let tx = self.conn.transaction()?;
@@ -592,7 +592,7 @@ impl ServerStorage {
         Ok(())
     }
 
-    fn write_shopping_list_handoff(
+    pub fn write_shopping_list_handoff(
         &mut self,
         shopping_list: &ShoppingList,
         uuid: &str,
@@ -613,7 +613,7 @@ impl ServerStorage {
         Ok(())
     }
 
-    fn get_shopping_list(&self, shopping_list_id: &Uuid) -> Result<Option<ShoppingList>> {
+    pub fn get_shopping_list(&self, shopping_list_id: &Uuid) -> Result<Option<ShoppingList>> {
         let hash = HashRing::hash(&shopping_list_id.to_string()).to_be_bytes();
 
         let mut stmt = self
@@ -633,7 +633,7 @@ impl ServerStorage {
     }
 
     // return dest + shopping list
-    fn get_hinted_handoffs(&self) -> Result<Vec<(Uuid, ShoppingList)>> {
+    pub fn get_hinted_handoffs(&self) -> Result<Vec<(Uuid, ShoppingList)>> {
         let mut stmt = self.conn.prepare(
             "SELECT crdt_data, hinted_handoff FROM shopping_lists WHERE hinted_handoff IS NOT NULL",
         )?;
@@ -655,7 +655,7 @@ impl ServerStorage {
     }
 
     // acho que isto funciona para quando node entra no hash ring
-    fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
+    pub fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
         let mut stmt = self.conn.prepare(
             "SELECT crdt_data FROM shopping_lists WHERE id < (?1) AND hinted_handoff IS NULL",
         )?;
