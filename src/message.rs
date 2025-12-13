@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
-use crate::crdt::ShoppingList;
+use crate::{crdt::ShoppingList, server::MembershipTable};
 
 #[derive(Serialize, Deserialize)]
 pub enum Request {
@@ -17,15 +17,6 @@ pub enum Response {
     Success { list_id: Uuid },
     ListState { items: Vec<String> },
     Error { message: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipTable(pub HashMap<Uuid, String>);
-
-impl MembershipTable {
-    pub fn insert(&mut self, uuid: Uuid, addr: String) {
-        self.0.insert(uuid, addr);
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

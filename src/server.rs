@@ -14,11 +14,32 @@ use std::time::{Duration, Instant};
 
 use crate::crdt::{Mergeable, ShoppingList};
 use crate::hash_ring::{HashRing, REPLICAS, VNODES};
-use crate::message::{MembershipTable, Msg};
+use crate::message::Msg;
 use crate::storage::ServerStorage;
 
 const GOSSIP_INTERVAL: u64 = 500;
 const JOIN_TIMEOUT: u64 = 1500;
+const FAILURE_TIMEOUT: u64 = 1000;
+
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MembershipTable(pub HashMap<Uuid, String>);
+
+impl MembershipTable {
+    pub fn insert(&mut self, uuid: Uuid, addr: String) {
+        self.0.insert(uuid, addr);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureTable(pub HashMap<Uuid, (String , Msg)>);
+
+impl FailureTable {
+    pub fn insert(&mut self, uuid: Uuid, addr: String, msg: Msg) {
+        self.0.insert(uuid, (addr, msg));
+    }
+}
+
 
 pub struct Peer {
     pub uuid: Uuid,
@@ -27,10 +48,11 @@ pub struct Peer {
     // network related
     addr: String,
     ctx: Context,
-    router: Mutex<Socket>, // for incoming messages
+    router: Mutex<Socket>,              // for incoming messages
     dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
-    hashring: Mutex<HashRing>,
+    hashring: Mutex<HashRing>,          // stores hashring
+    failure: Mutex<FailureTable>        // stores nodes which are failing
 }
 
 pub type SharedPeer = Arc<Peer>;
@@ -56,6 +78,8 @@ impl Peer {
         let mut hashring = HashRing::new(VNODES, REPLICAS);
         hashring.add_node(uuid.clone());
 
+        let failure = FailureTable(HashMap::new());
+
         anyhow::Ok(Self {
             ctx,
             uuid,
@@ -65,6 +89,7 @@ impl Peer {
             addr: bind_addr.to_string(),
             storage: Mutex::new(storage),
             hashring: Mutex::new(hashring),
+            failure: Mutex::new(failure),
         })
     }
 
@@ -177,6 +202,13 @@ impl Peer {
         };
 
         self.send_to(uuid, &msg)?;
+
+        anyhow::Ok(())
+    }
+
+    fn send_to_proxy(&self, msg: &Msg) -> Result<()> {
+        // TODO: isto e capaz de nao funcionar mt bem -> listen_proxy tem que drop lock
+
 
         anyhow::Ok(())
     }
@@ -538,12 +570,24 @@ impl Peer {
                     "[{}] Received GET_LIST for {} from {}",
                     self.uuid, list_id, identity
                 );
+
+                // TODO: tem que haver forma de ver se nodes mandam ACK para este especifico request
+                if let Ok(_) = self.is_coordinator(&list_id) {
+                    let replicas = self.get_replicas(&list_id);
+
+                    for uuid in replicas {
+                        self.send_to(&uuid, &msg);
+                    }
+
+                }
+
                 let list = {
                     let storage = self.storage.lock().unwrap();
                     storage.get_shopping_list(&list_id)?
                 };
 
                 let response = Msg::LIST_RESPONSE { list };
+
                 self.send_to(identity, &response)?;
             }
 
@@ -597,5 +641,29 @@ impl Peer {
         for n in nodes {
             hashring_guard.add_node(n);
         }
+    }
+
+    fn is_coordinator(&self, list_id: &Uuid) -> Result<bool> {
+        let hashring = self.hashring.lock().expect("poisoned");
+
+        let node_id = hashring.get_coordinator(list_id).expect("must have coordinator");
+
+        Ok(node_id == self.uuid.clone())
+    }
+
+    fn get_replicas(&self, list_id: &Uuid) -> Vec<Uuid> {
+        // NOTE: fn assumes we're the coordinator 
+        let hashring = self.hashring.lock().expect("poisoned");
+
+        // skip 'ourselves' 
+        hashring.get_preference_list(list_id).iter().skip(1).cloned().collect()
+    }
+
+    fn get_addresses(&self, ids: Vec<Uuid>) -> Vec<String> {
+        let membership = self.membership.lock().expect("poisoned");
+
+        ids.iter()
+            .filter_map(|id| membership.0.get(id).cloned())
+            .collect()
     }
 }
