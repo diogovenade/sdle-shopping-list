@@ -12,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::storage::ServerStorage;
-
 use crate::crdt::{ShoppingList, Mergeable};
+use crate::message::{Msg, MembershipTable};
 
 /*
 what i think server needs:
@@ -57,45 +57,6 @@ what i think server needs:
 
 const GOSSIP_INTERVAL: u64 = 500;
 const JOIN_TIMEOUT: u64 = 1500;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipTable(pub HashMap<String, String>);
-
-// so p nao ter q usar self.0 :p
-impl MembershipTable {
-    pub fn insert(&mut self, uuid: String, addr: String) {
-        self.0.insert(uuid, addr);
-    }
-}
-
-// TODO: mudar isto para message.rs, pensar em mais mensagens
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Msg {
-    HELLO { uuid: String, addr: String },
-    GOSSIP { table: MembershipTable },
-    PING,
-    ACK,
-    // Shopping list operations
-    GET_LIST { list_id: Uuid },
-    PUT_LIST { list: ShoppingList },
-    MERGE_LIST { list: ShoppingList },
-    LIST_RESPONSE { list: Option<ShoppingList> },
-}
-
-impl Msg {
-    pub fn name(&self) -> &'static str {
-        match self {
-            Msg::HELLO { .. } => "HELLO",
-            Msg::GOSSIP { .. } => "GOSSIP",
-            Msg::PING => "PING",
-            Msg::ACK => "ACK",
-            Msg::GET_LIST { .. } => "GET_LIST",
-            Msg::PUT_LIST { .. } => "PUT_LIST",
-            Msg::MERGE_LIST { .. } => "MERGE_LIST",
-            Msg::LIST_RESPONSE { .. } => "LIST_RESPONSE",
-        }
-    }
-}
 
 pub struct Peer {
     pub uuid: String,

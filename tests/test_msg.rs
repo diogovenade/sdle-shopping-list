@@ -1,5 +1,5 @@
 use sdle::crdt::{ShoppingList, AWORMap, Item};
-use sdle::server::Msg;
+use sdle::message::Msg;
 use uuid::Uuid;
 
 #[test]
