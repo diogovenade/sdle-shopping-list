@@ -207,17 +207,6 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    fn send_to_proxy(&self, msg: &Msg) -> Result<()> {
-        // TODO: isto e capaz de nao funcionar mt bem -> listen_proxy tem que drop lock
-
-
-        anyhow::Ok(())
-    }
-
-    // por agora threads implementadas
-    //   1) gossip p membership
-    //   2) listener
-
     async fn gossip(peer: SharedPeer) {
         let interval = Duration::from_millis(GOSSIP_INTERVAL);
 
@@ -373,17 +362,24 @@ impl Peer {
                                 payload_str.unwrap_or("<binary>")
                             );
 
-                            // TODO: parse/dispatch real client requests
-                            let reply = if let Some(s) = payload_str {
-                                format!("{}: ok ({})", peer.uuid, s).into_bytes()
-                            } else {
-                                format!("{}: ok ({} bytes)", peer.uuid, data_msg.len()).into_bytes()
-                            };
-
-                            let out_frames = vec![client_id_msg.to_vec(), Vec::new(), reply];
-
-                            if let Err(e) = dealer_guard.send_multipart(out_frames, 0) {
-                                eprintln!("[{}] send to proxy failed: {:?}", peer.uuid, e);
+                            // Parse the message and handle it
+                            match serde_json::from_slice::<Msg>(&data_msg) {
+                                Ok(msg) => {
+                                    let client_id = client_id_msg.to_vec();
+                                    drop(dealer_guard);
+                                    
+                                    if let Err(e) = peer.handle_incoming_proxy(client_id, msg) {
+                                        eprintln!("[{}] Error handling proxy request: {:?}", peer.uuid, e);
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("[{}] Failed to parse message: {:?}", peer.uuid, e);
+                                    let error_reply = format!("Error: Invalid message format").into_bytes();
+                                    let out_frames = vec![client_id_msg.to_vec(), Vec::new(), error_reply];
+                                    if let Err(e) = dealer_guard.send_multipart(out_frames, 0) {
+                                        eprintln!("[{}] send error reply failed: {:?}", peer.uuid, e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -514,6 +510,51 @@ impl Peer {
     }
 
     // ---- HANDLE MESSAGES ----
+
+    fn handle_incoming_proxy(&self, client_id: Vec<u8>, msg: Msg) -> Result<()> {
+        match msg {
+            Msg::GET_LIST { list_id } => {
+                println!(
+                    "[{}] Received GET_LIST for {} from proxy client",
+                    self.uuid, list_id
+                );
+
+                let list = {
+                    let storage = self.storage.lock().unwrap();
+                    storage.get_shopping_list(&list_id)?
+                };
+
+                let response = Msg::LIST_RESPONSE { list };
+                let reply = serde_json::to_vec(&response)?;
+
+                let dealer_guard = self.dealer.lock().unwrap();
+                let out_frames = vec![client_id, Vec::new(), reply];
+                dealer_guard.send_multipart(out_frames, 0)?;
+            }
+
+            Msg::PUT_LIST { list } => {
+                println!(
+                    "[{}] Received PUT_LIST for {} from proxy client",
+                    self.uuid, list.id
+                );
+                let mut storage = self.storage.lock().unwrap();
+                storage.write_shopping_list(&list)?;
+                
+                let response = format!("Stored shopping list {}", list.id).into_bytes();
+                let dealer_guard = self.dealer.lock().unwrap();
+                let out_frames = vec![client_id, Vec::new(), response];
+                dealer_guard.send_multipart(out_frames, 0)?;
+            }
+
+            _ => {
+                let error_reply = format!("Error: Unsupported message type for client requests").into_bytes();
+                let dealer_guard = self.dealer.lock().unwrap();
+                let out_frames = vec![client_id, Vec::new(), error_reply];
+                dealer_guard.send_multipart(out_frames, 0)?;
+            }
+        }
+        anyhow::Ok(())
+    }
 
     fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
