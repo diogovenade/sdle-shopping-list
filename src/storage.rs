@@ -1,4 +1,5 @@
 use crate::crdt::{AWORMap, GCounter, Item, LWWReg, Mergeable, PNCounter, ShoppingList};
+use crate::hash_ring::HashRing;
 use anyhow::Result;
 use rusqlite::{Connection, Result as sqlResult, Row, ToSql, params};
 use std::collections::HashMap;
@@ -566,7 +567,7 @@ impl ServerStorage {
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS shopping_lists (
-                id              TEXT PRIMARY KEY UNIQUE NOT NULL,
+                id              BLOB PRIMARY KEY UNIQUE NOT NULL,
                 crdt_data       BLOB NOT NULL,
                 hinted_handoff  TEXT
             )",
@@ -597,13 +598,14 @@ impl ServerStorage {
         uuid: &str,
     ) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
+        let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
 
         let tx = self.conn.transaction()?;
 
         tx.execute(
             "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
          VALUES (?1, ?2, ?3)",
-            params![shopping_list.id.to_string(), data, uuid],
+            params![hash.as_slice(), data, uuid],
         )?;
 
         tx.commit()?;
@@ -612,13 +614,13 @@ impl ServerStorage {
     }
 
     pub fn get_shopping_list(&self, shopping_list_id: &Uuid) -> Result<Option<ShoppingList>> {
+        let hash = HashRing::hash(&shopping_list_id.to_string()).to_be_bytes();
+
         let mut stmt = self
             .conn
             .prepare("SELECT crdt_data FROM shopping_lists WHERE id = ?1")?;
 
-        let list_id_str = shopping_list_id.to_string();
-
-        let mut rows = stmt.query(params![list_id_str])?;
+        let mut rows = stmt.query(params![hash.as_slice()])?;
 
         if let Some(row) = rows.next()? {
             let data: Vec<u8> = row.get(0)?;
@@ -648,6 +650,27 @@ impl ServerStorage {
                 Ok((uuid, shopping_list))
             })?
             .collect::<Result<Vec<(Uuid, ShoppingList)>, _>>()?;
+
+        Ok(rows)
+    }
+
+    // acho que isto funciona para quando node entra no hash ring
+    pub fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT crdt_data FROM shopping_lists WHERE id < (?1) AND hinted_handoff IS NULL",
+        )?;
+
+        let hash = HashRing::hash(&node_id.to_string()).to_be_bytes();
+
+        let rows = stmt
+            .query_map(params![hash.as_slice()], |row| {
+                let data: Vec<u8> = row.get(0)?;
+
+                let shopping_list: ShoppingList = serde_json::from_slice(&data).unwrap();
+
+                Ok(shopping_list)
+            })?
+            .collect::<Result<Vec<ShoppingList>, _>>()?;
 
         Ok(rows)
     }

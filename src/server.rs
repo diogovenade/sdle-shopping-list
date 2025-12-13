@@ -7,33 +7,36 @@ use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::crdt::{Mergeable, ShoppingList};
+use crate::hash_ring::{HashRing, REPLICAS, VNODES};
+use crate::message::{MembershipTable, Msg};
 use crate::storage::ServerStorage;
-use crate::crdt::{ShoppingList, Mergeable};
-use crate::message::{Msg, MembershipTable};
 
 const GOSSIP_INTERVAL: u64 = 500;
 const JOIN_TIMEOUT: u64 = 1500;
 
 pub struct Peer {
-    pub uuid: String,
+    pub uuid: Uuid,
     storage: Mutex<ServerStorage>,
 
     // network related
     addr: String,
     ctx: Context,
-    router: Mutex<Socket>,              // for incoming messages
+    router: Mutex<Socket>, // for incoming messages
     dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
+    hashring: Mutex<HashRing>,
 }
 
 pub type SharedPeer = Arc<Peer>;
 
 impl Peer {
-    pub fn new(uuid: &str, bind_addr: &str, proxy_addr: &str) -> Result<Self> {
+    pub fn new(uuid: Uuid, bind_addr: &str, proxy_addr: &str) -> Result<Self> {
         let ctx = Context::new();
 
         let router = ctx.socket(SocketType::ROUTER)?;
@@ -46,23 +49,29 @@ impl Peer {
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
-        membership.insert(uuid.to_string(), bind_addr.to_string());
+        membership.insert(uuid.clone(), bind_addr.to_string());
 
-        let storage = ServerStorage::new(uuid)?;
+        let storage = ServerStorage::new(&uuid.to_string())?;
+
+        let mut hashring = HashRing::new(VNODES, REPLICAS);
+        hashring.add_node(uuid.clone());
 
         anyhow::Ok(Self {
             ctx,
-            uuid: uuid.to_string(),
+            uuid,
             router: Mutex::new(router),
             dealer: Mutex::new(dealer),
             membership: Mutex::new(membership),
             addr: bind_addr.to_string(),
             storage: Mutex::new(storage),
+            hashring: Mutex::new(hashring),
         })
     }
 
+    // ---- NETWORK ----
+
     // open socket connection to peer
-    fn connect_to_peer(&self, uuid: &str) -> Result<Socket> {
+    fn connect_to_peer(&self, uuid: &Uuid) -> Result<Socket> {
         let peer_addr = {
             let table = self.membership.lock().unwrap();
             match table.0.get(uuid) {
@@ -74,7 +83,7 @@ impl Peer {
         };
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
-        let _ = dealer.set_identity(self.uuid.as_bytes());
+        let _ = dealer.set_identity(self.uuid.to_string().as_bytes());
         let _ = dealer.connect(&peer_addr);
 
         // self.dealers.insert(uuid.to_string(), dealer);
@@ -82,7 +91,7 @@ impl Peer {
         anyhow::Ok(dealer)
     }
 
-    fn close_conn(&self, uuid: &str, socket: Socket) -> Result<()> {
+    fn close_conn(&self, uuid: &Uuid, socket: Socket) -> Result<()> {
         let peer_addr = {
             let table = self.membership.lock().unwrap();
             match table.0.get(uuid) {
@@ -101,9 +110,9 @@ impl Peer {
     }
 
     // wrapper to send messages, open/closes conn and serializes Msg to JSON
-    fn send_to(&self, uuid: &str, msg: &Msg) -> Result<()> {
+    fn send_to(&self, uuid: &Uuid, msg: &Msg) -> Result<()> {
         // open socket
-        let socket = self.connect_to_peer(&uuid)?;
+        let socket = self.connect_to_peer(uuid)?;
 
         // send empty frame first
         let _ = socket.send("", zmq::SNDMORE);
@@ -114,7 +123,7 @@ impl Peer {
         socket.send(data, 0)?;
 
         // close socket
-        self.close_conn(&uuid, socket)?;
+        self.close_conn(uuid, socket)?;
 
         anyhow::Ok(())
     }
@@ -127,7 +136,7 @@ impl Peer {
 
         let msg = Msg::GOSSIP { table };
 
-        let peers: Vec<String> = {
+        let peers: Vec<Uuid> = {
             let table = self.membership.lock().unwrap();
             table.0.keys().cloned().collect()
         };
@@ -149,7 +158,7 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    fn send_gossip_to(&self, uuid: &str) -> Result<()> {
+    fn send_gossip_to(&self, uuid: &Uuid) -> Result<()> {
         // ensure the peer exists
         {
             let table = self.membership.lock().unwrap();
@@ -241,10 +250,18 @@ impl Peer {
                             // spawn new thread for concurrent message handling
                             let peer_clone = Arc::clone(&peer);
                             tokio::spawn(async move {
-                                let sender_uuid = match identity_msg.as_str() {
+                                let sender_uuid_str = match identity_msg.as_str() {
                                     Some(id) => id,
                                     None => {
-                                        eprintln!("Identity frame invalid");
+                                        eprintln!("Identity frame invalid: {:?}", identity_msg);
+                                        return;
+                                    }
+                                };
+
+                                let sender_uuid = match Uuid::from_str(sender_uuid_str) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("error parsing uuid: {e}");
                                         return;
                                     }
                                 };
@@ -282,7 +299,10 @@ impl Peer {
                             let client_id_msg = match dealer_guard.recv_msg(zmq::DONTWAIT) {
                                 Ok(msg) => msg,
                                 Err(e) => {
-                                    eprintln!("[{}] Failed to receive client_id: {:?}", peer.uuid, e);
+                                    eprintln!(
+                                        "[{}] Failed to receive client_id: {:?}",
+                                        peer.uuid, e
+                                    );
                                     continue;
                                 }
                             };
@@ -291,7 +311,10 @@ impl Peer {
                             let _ = match dealer_guard.recv_msg(0) {
                                 Ok(msg) => msg,
                                 Err(e) => {
-                                    eprintln!("[{}] Failed to receive empty frame: {:?}", peer.uuid, e);
+                                    eprintln!(
+                                        "[{}] Failed to receive empty frame: {:?}",
+                                        peer.uuid, e
+                                    );
                                     continue;
                                 }
                             };
@@ -300,7 +323,10 @@ impl Peer {
                             let data_msg = match dealer_guard.recv_msg(0) {
                                 Ok(msg) => msg,
                                 Err(e) => {
-                                    eprintln!("[{}] Failed to receive data frame: {:?}", peer.uuid, e);
+                                    eprintln!(
+                                        "[{}] Failed to receive data frame: {:?}",
+                                        peer.uuid, e
+                                    );
                                     continue;
                                 }
                             };
@@ -349,24 +375,18 @@ impl Peer {
             Peer::gossip(gossip_peer).await;
         });
 
-        let proxy_peer = Arc::clone(&peer);
+        let proxy = Arc::clone(&peer);
         tokio::spawn(async move {
-            Peer::listen_proxy(proxy_peer).await;
+            Peer::listen_proxy(proxy).await;
         });
 
         println!("[{}] Started successfully!", peer.uuid);
     }
 
-    pub fn ping(&mut self, uuid: &str) -> Result<()> {
-        let msg: Msg = Msg::PING;
-
-        self.send_to(uuid, &msg)
-    }
-
     // dont have peer in membership table -> normal send_to/connect_peer dont work
     pub fn join(&self, seed_addr: &str) -> Result<()> {
         let socket = self.ctx.socket(SocketType::DEALER)?;
-        socket.set_identity(self.uuid.as_bytes())?;
+        socket.set_identity(self.uuid.to_string().as_bytes())?;
         socket.connect(seed_addr)?;
 
         let hello = Msg::HELLO {
@@ -460,7 +480,9 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    fn handle_incoming(&self, identity: &str, msg: Msg) -> Result<()> {
+    // ---- HANDLE MESSAGES ----
+
+    fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
             Msg::GOSSIP { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
@@ -470,11 +492,15 @@ impl Peer {
                 for (u, addr) in table.0 {
                     membership_guard.insert(u, addr);
                 }
+
+                // update hashring
+                let peer_uuids = membership_guard.0.keys().cloned().collect();
+                self.add_nodes(peer_uuids);
             }
 
             Msg::PING {} => {
                 println!("[{}] Received PING from {}", self.uuid, identity);
-                self.send_to(&identity, &Msg::ACK)?;
+                self.send_to(identity, &Msg::ACK)?;
             }
 
             Msg::ACK => {
@@ -485,7 +511,7 @@ impl Peer {
                 println!("[{}] Received HELLO from {}", self.uuid, identity);
 
                 {
-                    // fazer operaçoes com locks dentro de brackets para ter a certeza q lock é solto 
+                    // fazer operaçoes com locks dentro de brackets para ter a certeza q lock é solto
 
                     let mut membership_guard = self.membership.lock().unwrap();
 
@@ -508,7 +534,10 @@ impl Peer {
             }
 
             Msg::GET_LIST { list_id } => {
-                println!("[{}] Received GET_LIST for {} from {}", self.uuid, list_id, identity);
+                println!(
+                    "[{}] Received GET_LIST for {} from {}",
+                    self.uuid, list_id, identity
+                );
                 let list = {
                     let storage = self.storage.lock().unwrap();
                     storage.get_shopping_list(&list_id)?
@@ -519,16 +548,22 @@ impl Peer {
             }
 
             Msg::PUT_LIST { list } => {
-                println!("[{}] Received PUT_LIST for {} from {}", self.uuid, list.id, identity);
+                println!(
+                    "[{}] Received PUT_LIST for {} from {}",
+                    self.uuid, list.id, identity
+                );
                 let mut storage = self.storage.lock().unwrap();
                 storage.write_shopping_list(&list)?;
                 println!("[{}] Stored shopping list {}", self.uuid, list.id);
             }
 
             Msg::MERGE_LIST { list } => {
-                println!("[{}] Received MERGE_LIST for {} from {}", self.uuid, list.id, identity);
+                println!(
+                    "[{}] Received MERGE_LIST for {} from {}",
+                    self.uuid, list.id, identity
+                );
                 let mut storage = self.storage.lock().unwrap();
-                
+
                 match storage.get_shopping_list(&list.id)? {
                     Some(mut existing) => {
                         existing.list.merge(&list.list);
@@ -538,7 +573,10 @@ impl Peer {
                     None => {
                         // no existing list, just store it
                         storage.write_shopping_list(&list)?;
-                        println!("[{}] Stored new shopping list {} (no existing to merge)", self.uuid, list.id);
+                        println!(
+                            "[{}] Stored new shopping list {} (no existing to merge)",
+                            self.uuid, list.id
+                        );
                     }
                 }
             }
@@ -549,5 +587,15 @@ impl Peer {
             }
         }
         anyhow::Ok(())
+    }
+
+    // ---- UTILITIES ----
+
+    fn add_nodes(&self, nodes: Vec<Uuid>) {
+        let mut hashring_guard = self.hashring.lock().expect("poisoned");
+
+        for n in nodes {
+            hashring_guard.add_node(n);
+        }
     }
 }

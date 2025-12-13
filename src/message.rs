@@ -20,17 +20,17 @@ pub enum Response {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MembershipTable(pub HashMap<String, String>);
+pub struct MembershipTable(pub HashMap<Uuid, String>);
 
 impl MembershipTable {
-    pub fn insert(&mut self, uuid: String, addr: String) {
+    pub fn insert(&mut self, uuid: Uuid, addr: String) {
         self.0.insert(uuid, addr);
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
-    HELLO { uuid: String, addr: String },
+    HELLO { uuid: Uuid, addr: String },
     GOSSIP { table: MembershipTable },
     PING,
     ACK,

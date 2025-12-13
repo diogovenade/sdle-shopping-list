@@ -3,6 +3,7 @@ use sdle::cli::ClientInterfaceManager;
 use sdle::client::Client;
 use sdle::proxy::Proxy;
 use sdle::server::{Peer, SharedPeer};
+use uuid::Uuid;
 use std::env;
 use std::{
     sync::{Arc, Mutex},
@@ -35,9 +36,9 @@ async fn main() -> Result<()> {
             let seed_addr = "tcp://127.0.0.1:6000";
             let proxy_backend = "tcp://127.0.0.1:5556";
 
-            let p1 = Peer::new("peer1", &seed_addr, &proxy_backend)?;
-            let p2 = Peer::new("peer2", "tcp://127.0.0.1:6001", &proxy_backend)?;
-            let p3 = Peer::new("peer3", "tcp://127.0.0.1:6002", &proxy_backend)?;
+            let p1 = Peer::new(Uuid::new_v4(), &seed_addr, &proxy_backend)?;
+            let p2 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6001", &proxy_backend)?;
+            let p3 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6002", &proxy_backend)?;
 
             let sp1: SharedPeer = Arc::new(p1);
             let sp2: SharedPeer = Arc::new(p2);
@@ -56,27 +57,8 @@ async fn main() -> Result<()> {
                 eprintln!("{} failed to join: {}", sp3.uuid, e);
             }
 
-
             Peer::start(Arc::clone(&sp2)).await;
             Peer::start(Arc::clone(&sp3)).await;
-
-            // to test -> peer 2 pings peer 3 every 2 seconds
-            // {
-            //     let sp2_clone = Arc::clone(&sp2);
-            //     thread::spawn(move || {
-            //         loop {
-            //             {
-            //                 let mut p2_guard = sp2_clone.lock().unwrap();
-            //                 if let Err(e) = p2_guard.ping("peer3") {
-            //                     eprintln!("[p2 -> p3] Ping failed: {}", e);
-            //                 } else {
-            //                     println!("[p2 -> p3] Ping sent");
-            //                 }
-            //             }
-            //             thread::sleep(Duration::from_secs(2));
-            //         }
-            //     });
-            // }
 
             loop {
                 thread::sleep(Duration::from_secs(1));
