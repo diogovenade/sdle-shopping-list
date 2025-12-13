@@ -31,12 +31,44 @@ impl MembershipTable {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FailureTable(pub HashMap<Uuid, (String , Msg)>);
+#[derive(Debug, Clone)]
+pub struct PeerFailureInfo {
+    pub last_failure: Instant,
+    pub consecutive_failures: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct FailureTable(pub HashMap<Uuid, PeerFailureInfo>);
 
 impl FailureTable {
-    pub fn insert(&mut self, uuid: Uuid, addr: String, msg: Msg) {
-        self.0.insert(uuid, (addr, msg));
+    pub fn new() -> Self {
+        Self(HashMap::new())
+    }
+
+    pub fn mark_failure(&mut self, uuid: Uuid) {
+        let entry = self.0.entry(uuid).or_insert(PeerFailureInfo {
+            last_failure: Instant::now(),
+            consecutive_failures: 0,
+        });
+        entry.last_failure = Instant::now();
+        entry.consecutive_failures += 1;
+    }
+
+    pub fn clear_failure(&mut self, uuid: &Uuid) {
+        self.0.remove(uuid);
+    }
+
+    pub fn is_available(&self, uuid: &Uuid) -> bool {
+        match self.0.get(uuid) {
+            None => true, 
+            Some(info) => {
+                // consider unavailable if more than 3 consecutive failures, OR failed within last FAILURE_TIMEOUT ms
+                if info.consecutive_failures > 3 {
+                    return false;
+                }
+                info.last_failure.elapsed() > Duration::from_millis(FAILURE_TIMEOUT)
+            }
+        }
     }
 }
 
@@ -78,7 +110,7 @@ impl Peer {
         let mut hashring = HashRing::new(VNODES, REPLICAS);
         hashring.add_node(uuid.clone());
 
-        let failure = FailureTable(HashMap::new());
+        let failure = FailureTable::new();
 
         anyhow::Ok(Self {
             ctx,
@@ -137,15 +169,35 @@ impl Peer {
     // wrapper to send messages, open/closes conn and serializes Msg to JSON
     fn send_to(&self, uuid: &Uuid, msg: &Msg) -> Result<()> {
         // open socket
-        let socket = self.connect_to_peer(uuid)?;
+        let socket = match self.connect_to_peer(uuid) {
+            Ok(s) => s,
+            Err(e) => {
+                self.mark_peer_failed(uuid);
+                return Err(e);
+            }
+        };
 
         // send empty frame first
-        let _ = socket.send("", zmq::SNDMORE);
+        if let Err(e) = socket.send("", zmq::SNDMORE) {
+            self.mark_peer_failed(uuid);
+            return Err(e.into());
+        }
 
         // send msg
         let data = serde_json::to_vec(msg)?;
         println!("[{}] Sending {:?} to {}", self.uuid, msg.name(), uuid);
-        socket.send(data, 0)?;
+        
+        match socket.send(data, 0) {
+            Ok(_) => {
+                // success! clear any previous failures
+                self.clear_peer_failure(uuid);
+            }
+            Err(e) => {
+                self.mark_peer_failed(uuid);
+                self.close_conn(uuid, socket).ok(); // Try to close, ignore errors
+                return Err(e.into());
+            }
+        }
 
         // close socket
         self.close_conn(uuid, socket)?;
@@ -665,5 +717,54 @@ impl Peer {
         ids.iter()
             .filter_map(|id| membership.0.get(id).cloned())
             .collect()
+    }
+
+    // ---- FAILURE DETECTION ----
+
+    fn mark_peer_failed(&self, uuid: &Uuid) {
+        let mut failure_table = self.failure.lock().expect("poisoned");
+        failure_table.mark_failure(*uuid);
+        eprintln!(
+            "[{}] Marked peer {} as failed (consecutive failures: {})",
+            self.uuid,
+            uuid,
+            failure_table.0.get(uuid).map(|f| f.consecutive_failures).unwrap_or(0)
+        );
+    }
+
+    fn clear_peer_failure(&self, uuid: &Uuid) {
+        let mut failure_table = self.failure.lock().expect("poisoned");
+        if failure_table.0.contains_key(uuid) {
+            println!("[{}] Cleared failure status for peer {}", self.uuid, uuid);
+            failure_table.clear_failure(uuid);
+        }
+    }
+
+    pub fn is_peer_available(&self, uuid: &Uuid) -> bool {
+        // Check if peer is in membership table
+        let in_membership = {
+            let membership = self.membership.lock().expect("poisoned");
+            membership.0.contains_key(uuid)
+        };
+
+        if !in_membership {
+            return false;
+        }
+
+        // Check if peer has recent failures
+        let failure_table = self.failure.lock().expect("poisoned");
+        failure_table.is_available(uuid)
+    }
+
+    #[allow(dead_code)]
+    fn get_failure_count(&self) -> usize {
+        let failure_table = self.failure.lock().expect("poisoned");
+        failure_table.0.len()
+    }
+
+    #[allow(dead_code)]
+    fn get_failed_peers(&self) -> Vec<Uuid> {
+        let failure_table = self.failure.lock().expect("poisoned");
+        failure_table.0.keys().copied().collect()
     }
 }

@@ -1,3 +1,4 @@
 /target
 /doc/Notes
 /data
+/tests/test_failure_detection.rs
