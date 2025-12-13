@@ -66,8 +66,9 @@ impl Peer {
         router.bind(bind_addr)?;
 
         let dealer = ctx.socket(SocketType::DEALER)?;
-        dealer.set_identity(uuid.as_bytes())?;
+        dealer.set_identity(uuid.to_string().as_bytes())?;
         dealer.connect(proxy_addr)?;
+        dealer.send("READY", 0)?;
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
