@@ -375,9 +375,9 @@ impl Peer {
             Peer::gossip(gossip_peer).await;
         });
 
-        let proxy_peer = Arc::clone(&peer);
+        let proxy = Arc::clone(&peer);
         tokio::spawn(async move {
-            Peer::listen_proxy(proxy_peer).await;
+            Peer::listen_proxy(proxy).await;
         });
 
         println!("[{}] Started successfully!", peer.uuid);

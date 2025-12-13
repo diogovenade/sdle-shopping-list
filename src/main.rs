@@ -57,27 +57,8 @@ async fn main() -> Result<()> {
                 eprintln!("{} failed to join: {}", sp3.uuid, e);
             }
 
-
             Peer::start(Arc::clone(&sp2)).await;
             Peer::start(Arc::clone(&sp3)).await;
-
-            // to test -> peer 2 pings peer 3 every 2 seconds
-            // {
-            //     let sp2_clone = Arc::clone(&sp2);
-            //     thread::spawn(move || {
-            //         loop {
-            //             {
-            //                 let mut p2_guard = sp2_clone.lock().unwrap();
-            //                 if let Err(e) = p2_guard.ping("peer3") {
-            //                     eprintln!("[p2 -> p3] Ping failed: {}", e);
-            //                 } else {
-            //                     println!("[p2 -> p3] Ping sent");
-            //                 }
-            //             }
-            //             thread::sleep(Duration::from_secs(2));
-            //         }
-            //     });
-            // }
 
             loop {
                 thread::sleep(Duration::from_secs(1));
