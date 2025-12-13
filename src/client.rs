@@ -1,5 +1,5 @@
 use uuid::Uuid;
-use zmq::{Context, Error as zmqErr, SocketType};
+use zmq::{Context, Error as zmqErr, SocketType, Socket};
 use crate::storage::{ClientStorage};
 use crate::crdt::{ShoppingList};
 use crate::message::Msg;
@@ -39,14 +39,21 @@ pub struct ItemInterface {
 pub struct Client {
     pub id: Uuid,
     storage_handler: ClientStorage,
+    context: Context,
+    socket: Socket,
 }
 
 impl Client {
     pub fn new() -> Result<Self> {
         let storage_handler = ClientStorage::new()?;
+        let context = Context::new();
+        let socket = context.socket(SocketType::REQ)?;
+        socket.connect("tcp://127.0.0.1:5555")?;
         Ok(Self {
             id: storage_handler.client_id,
             storage_handler,
+            context,
+            socket,
         })
     }
 

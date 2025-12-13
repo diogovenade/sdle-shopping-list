@@ -30,8 +30,6 @@ impl Proxy {
     }
 
     pub fn start(&mut self) -> Result<()> {
-        let target_server_id = "peer1".to_string(); // apenas para testar, depois mudar com lógica do hash ring
-
         let mut items = [
             self.frontend.as_poll_item(POLLIN),
             self.backend.as_poll_item(POLLIN),
@@ -46,7 +44,7 @@ impl Proxy {
 
                 // msg: [client_id][empty][payload]
                 // Backend ROUTER requires: [server_id][client_id][empty][payload]
-                
+
                 if msg.len() < 3 {
                     continue; // malformed
                 }
