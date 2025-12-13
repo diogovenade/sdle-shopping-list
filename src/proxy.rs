@@ -43,14 +43,32 @@ impl Proxy {
             // Frontend
             if items[0].is_readable() {
                 let mut msg = self.frontend.recv_multipart(0)?;
-                // TODO: Use consistent hashing to pick server identity
-                // algo como -> let server_id = hash_ring.get_coordinator(&request_key);
-                // Prepend server identity to msg and send to backend
 
-                // msg is typically: [client_id][empty][payload]
+                // msg: [client_id][empty][payload]
                 // Backend ROUTER requires: [server_id][client_id][empty][payload]
-                msg.insert(0, target_server_id.as_bytes().to_vec());
-                self.backend.send_multipart(msg, 0)?;
+                
+                if msg.len() < 3 {
+                    continue; // malformed
+                }
+
+                let payload = &msg[2];
+
+                let server_id = match serde_json::from_slice::<Msg>(payload) {
+                    Ok(Msg::GET_LIST { list_id }) |
+                    Ok(Msg::PUT_LIST { list: crate::crdt::ShoppingList { id: list_id, .. } }) |
+                    Ok(Msg::MERGE_LIST { list: crate::crdt::ShoppingList { id: list_id, .. } }) => {
+                        self.ring.get_coordinator(&list_id)
+                    }
+                    _ => None,
+                };
+
+                if let Some(server_id) = server_id {
+                    // prepend server identity to msg and send to backend
+                    msg.insert(0, server_id.to_string().as_bytes().to_vec());
+                    self.backend.send_multipart(msg, 0)?;
+                } else {
+                    eprintln!("Proxy: Could not determine server for client request");
+                }
             }
 
             // Backend
