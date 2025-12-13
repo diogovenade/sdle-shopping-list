@@ -4,6 +4,8 @@ use uuid::Uuid;
 
 pub const VNODES: usize = 3;
 pub const REPLICAS: usize = 3;
+pub const WRITE_NODES: usize = 2; // minimum number of nodes that must participate in a write
+pub const READ_NODES: usize = 2;  // minimum number of nodes that must participate in a read
 
 pub struct HashRing {
     ring: BTreeMap<u128, Uuid>, // hash -> server_id
