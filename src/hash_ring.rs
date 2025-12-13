@@ -23,7 +23,7 @@ impl HashRing {
     pub fn add_node(&mut self, node_id: Uuid) {
         for i in 0..self.virtual_nodes {
             let key = format!("{}-{}", node_id, i);
-            let hash = self.hash(&key);
+            let hash = HashRing::hash(&key);
             self.ring.insert(hash, node_id);
         }
     }
@@ -31,7 +31,7 @@ impl HashRing {
     pub fn remove_node(&mut self, node_id: Uuid) {
         for i in 0..self.virtual_nodes {
             let key = format!("{}-{}", node_id, i);
-            let hash = self.hash(&key);
+            let hash = HashRing::hash(&key);
             self.ring.remove(&hash);
         }
     }
@@ -41,7 +41,7 @@ impl HashRing {
             return vec![];
         }
 
-        let hash = self.hash(&list_id.to_string());
+        let hash = HashRing::hash(&list_id.to_string());
         let mut preference_list = Vec::new();
         let mut seen_servers = HashSet::new();
 
@@ -74,7 +74,7 @@ impl HashRing {
         self.get_all_servers().len()
     }
 
-    fn hash(&self, key: &str) -> u128 {
+    pub fn hash(key: &str) -> u128 {
         let mut hasher = Md5::new();
         hasher.update(key.as_bytes());
         let result = hasher.finalize();

@@ -116,7 +116,8 @@ impl Peer {
 
         let storage = ServerStorage::new(&uuid.to_string())?;
 
-        let hashring = HashRing::new(VNODES, REPLICAS);
+        let mut hashring = HashRing::new(VNODES, REPLICAS);
+        hashring.add_node(uuid.clone());
 
         anyhow::Ok(Self {
             ctx,
@@ -128,6 +129,8 @@ impl Peer {
             hashring: Mutex::new(hashring),
         })
     }
+
+    // ---- NETWORK ----
 
     // open socket connection to peer
     fn connect_to_peer(&self, uuid: &Uuid) -> Result<Socket> {
@@ -143,8 +146,8 @@ impl Peer {
 
         let dealer = self.ctx.socket(SocketType::DEALER)?;
 
-        dealer.set_identity(self.uuid.to_string().as_bytes());
-        dealer.connect(&peer_addr);
+        let _ = dealer.set_identity(self.uuid.to_string().as_bytes());
+        let _ = dealer.connect(&peer_addr);
 
         // self.dealers.insert(uuid.to_string(), dealer);
 
@@ -345,6 +348,8 @@ impl Peer {
         });
     }
 
+    // ---- PEER SETUP ----
+
     pub async fn start(peer: SharedPeer) {
         let listen_peer = Arc::clone(&peer);
         tokio::spawn(async move {
@@ -456,6 +461,8 @@ impl Peer {
         anyhow::Ok(())
     }
 
+    // ---- HANDLE MESSAGES ----
+
     fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
             Msg::GOSSIP { table } => {
@@ -466,6 +473,10 @@ impl Peer {
                 for (u, addr) in table.0 {
                     membership_guard.insert(u, addr);
                 }
+
+                // update hashring
+                let peer_uuids = membership_guard.0.keys().cloned().collect();
+                self.add_nodes(peer_uuids);
             }
 
             Msg::PING {} => {
@@ -504,5 +515,15 @@ impl Peer {
             }
         }
         anyhow::Ok(())
+    }
+
+    // ---- UTILITIES ----
+
+    fn add_nodes(&self, nodes: Vec<Uuid>) {
+        let mut hashring_guard = self.hashring.lock().expect("poisoned");
+        
+        for n in nodes {
+            hashring_guard.add_node(n);
+        }
     }
 }
