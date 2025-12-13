@@ -1,7 +1,9 @@
 use uuid::Uuid;
-use zmq::{Context, Error as zmqErr, SocketType};
+use zmq::{Context, Error as zmqErr, SocketType, Socket};
 use crate::storage::{ClientStorage};
 use crate::crdt::{ShoppingList};
+use crate::message::Msg;
+use serde_json;
 use anyhow::Result;
 use std::collections::HashMap;
 
@@ -37,14 +39,21 @@ pub struct ItemInterface {
 pub struct Client {
     pub id: Uuid,
     storage_handler: ClientStorage,
+    context: Context,
+    socket: Socket,
 }
 
 impl Client {
     pub fn new() -> Result<Self> {
         let storage_handler = ClientStorage::new()?;
+        let context = Context::new();
+        let socket = context.socket(SocketType::REQ)?;
+        socket.connect("tcp://127.0.0.1:5555")?;
         Ok(Self {
             id: storage_handler.client_id,
             storage_handler,
+            context,
+            socket,
         })
     }
 
@@ -82,15 +91,16 @@ impl Client {
         println!("Connecting to proxy frontend...");
         let context = Context::new();
         let requester = context.socket(SocketType::REQ)?;
-        let _ = requester.connect("tcp://127.0.0.1:5555");
+        requester.connect("tcp://127.0.0.1:5555")?;
 
-        for request in 1..11 {
-            println!("Sending hello... {}", request);
-            let message = "Hello server!";
-            requester.send(message, 0)?;
-            let message = requester.recv_msg(0)?;
-            println!("Received: {}", message.as_str().unwrap_or("Invalid UTF-8"));
-        }
+        let list_id = Uuid::new_v4();
+        let msg = Msg::GET_LIST { list_id };
+        let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
+
+        requester.send(payload, 0)?;
+
+        let reply = requester.recv_multipart(0)?;
+        println!("Received reply: {:?}", reply);
 
         Ok(())
     }

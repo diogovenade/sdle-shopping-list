@@ -67,7 +67,7 @@ async fn main() -> Result<()> {
         "proxy" => {
             let frontend_addr = "tcp://127.0.0.1:5555";
             let backend_addr = "tcp://127.0.0.1:5556";
-            let proxy = Proxy::new(frontend_addr, backend_addr)?;
+            let mut proxy = Proxy::new(frontend_addr, backend_addr)?;
             println!("Proxy running: frontend at {}, backend at {}", frontend_addr, backend_addr);
             proxy.start()?;
         }
