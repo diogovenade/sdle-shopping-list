@@ -89,6 +89,18 @@ impl Client {
         }
     }
 
+    fn send_list(&self, list: &ShoppingList) -> Result<()> {
+        let msg = Msg::PUT_LIST { list: list.clone() };
+        let payload = serde_json::to_vec(&msg)?;
+
+        self.socket.send(payload, 0)?;
+
+        let reply = self.socket.recv_msg(0)?;
+        println!("Server response: {:?}", String::from_utf8_lossy(&reply));
+
+        Ok(())
+    }
+
     pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
         let local_list = self.storage_handler.read_shopping_list(list_id)?;
         let remote_list = self.fetch_list(list_id)?;
@@ -107,7 +119,10 @@ impl Client {
     }
 
     pub fn send_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) -> Result<()> {
-        self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id)?; 
+        self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id)?;
+
+        let updated_list = self.storage_handler.read_shopping_list(shoppinglist_id)?;
+        self.send_list(&updated_list)?;
         Ok(())
     }
 
