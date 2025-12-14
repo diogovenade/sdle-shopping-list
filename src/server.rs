@@ -400,7 +400,7 @@ impl Peer {
                                     }
                                 };
 
-                                if let Err(e) = peer_clone.handle_incoming(&sender_uuid, msg) {
+                                if let Err(e) = peer_clone.handle_incoming(&sender_uuid, msg).await {
                                     eprintln!(
                                         "Error handling message from {}: {:?}",
                                         sender_uuid, e
