@@ -968,11 +968,26 @@ impl Peer {
                 for (dest, list) in handoffs {
                     let msg = Msg::ReplicateList {
                         id: Uuid::new_v4().to_string(), // no need for quorom so random uuid is ok
-                        list,
+                        list: list.clone(),
                         write: true,
                     };
 
-                    let _ = peer_clone.send_to(&dest, &msg);
+                    match peer_clone.send_to(&dest, &msg) {
+                        Ok(_) => {
+                            // if ccan send delete from DB
+                            let _ = peer_clone
+                                .storage
+                                .lock()
+                                .expect("poisoned")
+                                .delete_shopping_list(&list.id);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[{}] Failed sending hinted handoff data: {:?}",
+                                peer_clone.uuid, e
+                            );
+                        }
+                    }
                 }
 
                 anyhow::Ok(())
@@ -980,7 +995,10 @@ impl Peer {
             .await;
 
             if let Err(e) = result {
-                eprintln!("Hinted handoff blocking task failed: {:?}", e);
+                eprintln!(
+                    "[{}] Hinted handoff blocking task failed: {:?}",
+                    peer.uuid, e
+                );
             }
         }
     }
