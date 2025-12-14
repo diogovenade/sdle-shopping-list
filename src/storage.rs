@@ -715,6 +715,7 @@ impl ServerStorage {
     // NOTE: solved probably
     pub fn get_old_data(&self, node_id: &Uuid, prev_node_hash: u128) -> Result<Vec<ShoppingList>> {
         let hash = HashRing::hash(&node_id.to_string());
+        let prev_bytes = prev_node_hash.to_be_bytes();
 
         let query = if prev_node_hash < hash {
             "SELECT crdt_data FROM shopping_lists WHERE id > ?1 AND id <= ?2 AND hinted_handoff IS NULL"
@@ -728,7 +729,7 @@ impl ServerStorage {
         let hash_bytes = hash.to_be_bytes();
 
         let rows = stmt
-            .query_map(params![hash_bytes.as_slice()], |row| {
+            .query_map(params![hash_bytes.as_slice(), prev_bytes.as_slice(),], |row| {
                 let data: Vec<u8> = row.get(0)?;
 
                 let shopping_list: ShoppingList = serde_json::from_slice(&data).unwrap();
@@ -743,7 +744,7 @@ impl ServerStorage {
     pub fn get_all_rows(&self) -> Result<Vec<(u128, ShoppingList)>> {
         let mut stmt = self
             .db_conn
-            .prepare("SELECT (id, crdt_data) FROM shopping_lists")?;
+            .prepare("SELECT id, crdt_data FROM shopping_lists")?;
 
         let rows = stmt
             .query_map([], |row| {

@@ -162,7 +162,7 @@ async fn main() -> Result<()> {
                 let addr = format!("tcp://127.0.0.1:{}", port);
                 let ctx = Context::new();
                 let socket = ctx.socket(zmq::REQ)?;
-                socket.set_identity(b""); // acho q e preciso
+                socket.set_identity(Uuid::new_v4().to_string().as_bytes()); // acho q e preciso
                 socket.connect(&addr)?;
 
                 let msg = Msg::Leave;

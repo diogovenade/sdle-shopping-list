@@ -645,7 +645,7 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    pub fn leave(&self) {
+    pub fn leave(&self) -> Result<()>{
         let mut hashring = self.hashring.lock().expect("poisoned");
 
         // remove ourselves from hashring
@@ -653,7 +653,7 @@ impl Peer {
 
         let storage = self.storage.lock().expect("poisoned");
 
-        let rows = storage.get_all_rows().expect("db errror/no rows?");
+        let rows = storage.get_all_rows()?;
 
         for (hash, list) in rows {
             let preference_list = hashring.get_preference_list_hash(hash);
@@ -688,6 +688,8 @@ impl Peer {
                 }
             }
         }
+
+        Ok(())
     }
 
     // ---- HANDLE MESSAGES ----
