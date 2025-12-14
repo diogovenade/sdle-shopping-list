@@ -94,7 +94,13 @@ impl Client {
         requester.connect("tcp://127.0.0.1:5555")?;
 
         let list_id = Uuid::new_v4();
-        let msg = Msg::GET_LIST { list_id };
+        let shopping_list = crate::crdt::ShoppingList {
+            id: list_id,
+            list: crate::crdt::AWORMap::new(),
+        };
+
+        // Send a PutList message with the new shopping list
+        let msg = Msg::GetList { list: shopping_list };
         let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
 
         requester.send(payload, 0)?;
