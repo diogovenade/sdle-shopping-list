@@ -34,8 +34,8 @@ pub struct ClientStorage {
 }
 
 impl ClientStorage {
-    pub fn new() -> Result<Self> {
-        let db_path = Self::compute_db_path()?;
+    pub fn new(username: String) -> Result<Self> {
+        let db_path = Self::compute_db_path(username)?;
         let db_conn = Connection::open(&db_path)?;
         db_conn.execute_batch("PRAGMA foreign_keys = ON;")?;
         db_conn.execute_batch("PRAGMA journal_mode = WAL;")?;
@@ -71,11 +71,12 @@ impl ClientStorage {
         Ok(id)
     }
 
-    fn compute_db_path() -> std::io::Result<PathBuf> {
+    fn compute_db_path(username: String) -> std::io::Result<PathBuf> {
         let mut root = std::env::current_dir()?; // appropriate directory for dev,
         // i.e. cargo run, cargo test, etc.
         root.push("data");
         root.push("clientstorage");
+        root.push(username);
         std::fs::create_dir_all(&root)?;
         root.push("client.db");
         Ok(root)

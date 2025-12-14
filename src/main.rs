@@ -1,10 +1,11 @@
 use anyhow::Result;
-use sdle::cli::ClientInterfaceManager;
+use sdle::cli::{ClientInterfaceManager, InputRule};
 use sdle::client::Client;
 use sdle::proxy::Proxy;
 use sdle::server::{Peer, SharedPeer};
 use uuid::Uuid;
 use std::env;
+use std::io::{self, Write};
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -30,7 +31,17 @@ async fn main() -> Result<()> {
 
     match run_opt.as_str() {
         "client" => {
-            let client = Client::new()?;
+            let mut username = String::new();
+            print!("\x1B[2J\x1B[1;1H");
+            println!("Enter username");
+            print!("> ");
+            io::stdout().flush().unwrap();
+            ClientInterfaceManager::read_validated_input(&mut username, &[
+                InputRule::Custom(Box::new(|s| {
+                    s[..].chars().all(|c| c.is_ascii_alphabetic())
+                }))
+            ]);
+            let client = Client::new(username)?;
             let mut client_interface = ClientInterfaceManager::new(client);
             while !client_interface.is_done() {
                 client_interface.render();
@@ -76,7 +87,7 @@ async fn main() -> Result<()> {
             proxy.start()?;
         }
         "client-test" => {
-            let client = Client::new()?;
+            let client = Client::new(String::from("test"))?;
             client.connect()?;
         }
         _ => {

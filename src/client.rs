@@ -43,11 +43,23 @@ pub struct Client {
     socket: Socket,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Ensure socket close never blocks
+        let _ = self.socket.set_linger(0);
+
+        // Optional but explicit
+        let _ = self.socket.disconnect("tcp://127.0.0.1:5555");
+    }
+}
+
 impl Client {
-    pub fn new() -> Result<Self> {
-        let storage_handler = ClientStorage::new()?;
+    pub fn new(username: String) -> Result<Self> {
+        let storage_handler = ClientStorage::new(username)?;
         let context = Context::new();
         let socket = context.socket(SocketType::REQ)?;
+        socket.set_rcvtimeo(100)?; 
+        socket.set_linger(0)?;    
         socket.connect("tcp://127.0.0.1:5555")?;
         Ok(Self {
             id: storage_handler.client_id,
@@ -55,6 +67,12 @@ impl Client {
             context,
             socket,
         })
+    }
+
+    fn reset_socket(&self) -> Result<()> {
+        self.socket.disconnect("tcp://127.0.0.1:5555")?;
+        self.socket.connect("tcp://127.0.0.1:5555")?;
+        Ok(())
     }
 
     pub fn retrieve_available_lists(&self) -> Result<Option<Vec<ShoppingListInterface>>> {
@@ -78,14 +96,26 @@ impl Client {
         let msg = Msg::GetList { list: list.clone() };
         let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
 
-        self.socket.send(payload, 0)?;
+        if let Err(e) = self.socket.send(payload, zmq::DONTWAIT) {
+            self.reset_socket()?;
+            return Ok(None)
+        }
 
-        let reply = self.socket.recv_msg(0)?;
-        let response: Msg = serde_json::from_slice(&reply)?;
+        let reply_res = self.socket.recv_msg(0);
+        match reply_res {
+            Ok(reply) => {
+                let response: Msg = serde_json::from_slice(&reply)?;
 
-        match response {
-            Msg::ListResponse { list } => Ok(list),
-            _ => anyhow::bail!("Unexpected response from server"),
+                match response {
+                    Msg::ListResponse { list } => Ok(list),
+                    _ => anyhow::bail!("Unexpected response from server"),
+                }
+            }
+            Err(zmq::Error::EAGAIN) => {
+                self.reset_socket()?;
+                return Ok(None) // server unavailable or slow
+            }
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -93,10 +123,21 @@ impl Client {
         let msg = Msg::PutList { list: list.clone() };
         let payload = serde_json::to_vec(&msg)?;
 
-        self.socket.send(payload, 0)?;
+        if let Err(e) = self.socket.send(payload, zmq::DONTWAIT) {
+            self.reset_socket()?;
+            return Ok(()) // no server connected, local first
+        }
 
-        let reply = self.socket.recv_msg(0)?;
-        println!("Server response: {:?}", String::from_utf8_lossy(&reply));
+        match self.socket.recv_msg(0) {
+            Ok(reply) => {
+                println!("Server response: {:?}", String::from_utf8_lossy(&reply));
+            }
+            Err(zmq::Error::EAGAIN) => {
+                self.reset_socket()?;
+                return Ok(()) // server unavailable or slow
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         Ok(())
     }

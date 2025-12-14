@@ -9,7 +9,7 @@ use std::collections::HashMap;
 const CLEAR_SEQUENCE: &'static str = "\x1B[2J\x1B[1;1H";
 const UPPER_ITEM_COUNT_LIMIT: usize = 1000000;
 
-enum InputRule<'a> {
+pub enum InputRule<'a> {
     AcceptStrings(&'a [&'a str]),
     AcceptNumberRange { low: usize, high: usize },
     Custom(Box<dyn Fn(&str) -> bool + 'a>),
@@ -323,7 +323,7 @@ impl ClientInterfaceManager {
         matches!(self.screen, State::Exit)
     }
 
-    fn read_validated_input(dest: &mut String, rules: &[InputRule<'_>]) {
+    pub fn read_validated_input(dest: &mut String, rules: &[InputRule<'_>]) {
         loop {
             dest.clear();
             io::stdout().flush().unwrap();
