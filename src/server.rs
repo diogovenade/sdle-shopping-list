@@ -730,11 +730,12 @@ impl Peer {
                                     storage.write_shopping_list(&l)?;
                                 }
 
-                                let ack = Msg::Ack {
+                                let ack = Msg::AckList {
                                     request_id: "".to_string(),
+                                    list: l
                                 };
 
-                                self.send_to_proxy(&client_id, &ack);
+                                let _ = self.send_to_proxy(&client_id, &ack);
 
                                 println!("[{}] Read shopping list {}", self.uuid, list.id);
                             }
@@ -743,7 +744,7 @@ impl Peer {
                                     request_id: "".to_string(),
                                 };
 
-                                self.send_to_proxy(&client_id, &nack);
+                                let _ = self.send_to_proxy(&client_id, &nack);
                                 eprintln!("[{}] Error reading list {}: {}", self.uuid, list.id, e);
                             }
                         }
@@ -1031,8 +1032,9 @@ impl Peer {
                 let mut storage = self.storage.lock().expect("poisoned");
                 storage.write_shopping_list(&list)?;
 
-                let ack = Msg::Ack {
+                let ack = Msg::AckList {
                     request_id: "".to_string(),
+                    list: list.clone()
                 };
 
                 let _ = self.send_to_proxy(&client_id, &ack);
