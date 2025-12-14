@@ -1,11 +1,13 @@
 use anyhow::Result;
-use tokio::time::sleep;
+use tokio::time::error::Elapsed;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use zmq::{Context, Error, PollItem, SNDMORE, Socket, SocketType};
 
 use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -13,14 +15,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::crdt::{Mergeable, ShoppingList};
-use crate::hash_ring::{HashRing, REPLICAS, VNODES};
+use crate::hash_ring::{HashRing, READ_NODES, REPLICAS, VNODES, WRITE_NODES};
 use crate::message::Msg;
 use crate::storage::ServerStorage;
 
 const GOSSIP_INTERVAL: u64 = 500; // ms
 const JOIN_TIMEOUT: u64 = 1500;
 const FAILURE_TIMEOUT: u64 = 1000;
-
+const REPLICATE_TIMEOUT: u64 = 3000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<Uuid, String>);
@@ -56,15 +58,16 @@ impl FailureTable {
     pub fn mark_failure(&mut self, server_id: Uuid) {
         let now = Instant::now();
 
-        self.0.entry(server_id).and_modify(|e| {
-            e.last_failure = now;
-            e.consecutive_failures +=1;
-        }).or_insert(
-            PeerFailureInfo {
+        self.0
+            .entry(server_id)
+            .and_modify(|e| {
+                e.last_failure = now;
+                e.consecutive_failures += 1;
+            })
+            .or_insert(PeerFailureInfo {
                 last_failure: now,
-                consecutive_failures: 1
-            }
-        );
+                consecutive_failures: 1,
+            });
     }
 
     pub fn clear_failure(&mut self, server_id: &Uuid) {
@@ -73,7 +76,7 @@ impl FailureTable {
 
     pub fn is_available(&self, server_id: &Uuid) -> bool {
         match self.0.get(server_id) {
-            None => true, 
+            None => true,
             Some(info) => {
                 // consider unavailable if more than 3 consecutive failures, OR failed within last FAILURE_TIMEOUT ms
                 if info.consecutive_failures > 3 {
@@ -85,19 +88,55 @@ impl FailureTable {
     }
 }
 
+// for storing requests information
+struct QuoromState {
+    needed: usize,
+    received: usize,
+    pub responder: Option<oneshot::Sender<()>>,
+    lists: Vec<ShoppingList>,
+}
+
+impl QuoromState {
+    pub fn is_quorom_reached(&self) -> bool {
+        self.received >= self.needed
+    }
+
+    pub fn merge_lists(&self) -> Result<ShoppingList> {
+        let mut merged = match self.lists.first() {
+            Some(list) => list.clone(),
+            None => return Err(anyhow::anyhow!("No shopping lists to merge")),
+        };
+
+        for list in self.lists.iter().skip(1) {
+            merged.list.merge(&list.list);
+        }
+
+        Ok(merged)
+    }
+
+    pub fn add_list(&mut self, list: ShoppingList) {
+        self.received += 1;
+        self.lists.push(list);
+    }
+
+    pub fn increment_received(&mut self) {
+        self.received += 1;
+    }
+}
 
 pub struct Peer {
     pub uuid: Uuid, // NOTE: apparently the server id is the dealer id of the one connected to the proxy
-    storage: Mutex<ServerStorage>, 
+    storage: Mutex<ServerStorage>,
 
     // network related
     addr: String,
     ctx: Context,
-    router: Mutex<Socket>,              // for incoming messages
+    router: Mutex<Socket>, // for incoming messages
     proxy_dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
     hashring: Mutex<HashRing>,          // stores hashring
-    failure: Mutex<FailureTable>        // stores nodes which are failing
+    failure: Mutex<FailureTable>,       // stores nodes which are failing
+    in_flight: Mutex<HashMap<String, QuoromState>>, // unresolved requests
 }
 
 pub type SharedPeer = Arc<Peer>;
@@ -126,6 +165,7 @@ impl Peer {
 
         let failure = FailureTable::new();
 
+        let in_flight = HashMap::<String, QuoromState>::new();
 
         anyhow::Ok(Self {
             ctx,
@@ -137,6 +177,7 @@ impl Peer {
             storage: Mutex::new(storage),
             hashring: Mutex::new(hashring),
             failure: Mutex::new(failure),
+            in_flight: Mutex::new(in_flight),
         })
     }
 
@@ -184,7 +225,7 @@ impl Peer {
     // wrapper to send messages, open/closes conn and serializes Msg to JSON
     // NOTE: it is a TERRIBLE design to open ephemeral sockets and connections
     // whenever we want to send a message. sockets and connections NEED to be long lived
-    // and reused. also, we CANNOT reuse the identity of the server (dealer connected to 
+    // and reused. also, we CANNOT reuse the identity of the server (dealer connected to
     // proxy) for each of its dealers connected to other peers!!
     fn send_to(&self, uuid: &Uuid, msg: &Msg) -> Result<()> {
         // open socket
@@ -205,7 +246,7 @@ impl Peer {
         // send msg
         let data = serde_json::to_vec(msg)?;
         println!("[{}] Sending {:?} to {}", self.uuid, msg.name(), uuid);
-        
+
         match socket.send(data, 0) {
             Ok(_) => {
                 // success! clear any previous failures
@@ -224,13 +265,27 @@ impl Peer {
         Ok(())
     }
 
+    fn send_to_proxy(&self, client_id: &Uuid, msg: &Msg) -> Result<()> {
+        let client_id_bytes = client_id.as_bytes();
+        let empty = b"";
+        let data = serde_json::to_vec(msg)?;
+
+        let out_frames: Vec<&[u8]> = vec![client_id_bytes, empty, &data];
+
+        let dealer_guard = self.proxy_dealer.lock().expect("poisoned");
+
+        dealer_guard.send_multipart(out_frames, 0)?;
+
+        Ok(())
+    }
+
     fn send_gossip(&self) -> Result<()> {
         let table = {
             let table = self.membership.lock().unwrap();
             table.clone()
         };
 
-        let msg = Msg::GOSSIP { table };
+        let msg = Msg::Gossip { table };
 
         let peers: Vec<Uuid> = {
             let table = self.membership.lock().unwrap();
@@ -268,7 +323,7 @@ impl Peer {
             table.clone()
         };
 
-        let msg = Msg::GOSSIP {
+        let msg = Msg::Gossip {
             table: table_snapshot,
         };
 
@@ -358,7 +413,8 @@ impl Peer {
                                     }
                                 };
 
-                                if let Err(e) = peer_clone.handle_incoming(&sender_uuid, msg) {
+                                if let Err(e) = peer_clone.handle_incoming(&sender_uuid, msg).await
+                                {
                                     eprintln!(
                                         "Error handling message from {}: {:?}",
                                         sender_uuid, e
@@ -423,34 +479,39 @@ impl Peer {
                                 }
                             };
 
-                            let payload_str = std::str::from_utf8(&data_msg).ok();
-
-                            println!(
-                                "[{}] proxy: received request from client {} payload={:?}",
-                                peer.uuid,
-                                client_id_msg.as_str().unwrap_or("<binary>"),
-                                payload_str.unwrap_or("<binary>")
-                            );
-
-                            // Parse the message and handle it
-                            match serde_json::from_slice::<Msg>(&data_msg) {
-                                Ok(msg) => {
-                                    let client_id = client_id_msg.to_vec();
-                                    drop(dealer_guard);
-                                    
-                                    if let Err(e) = peer.handle_incoming_proxy(client_id, msg) {
-                                        eprintln!("[{}] Error handling proxy request: {:?}", peer.uuid, e);
-                                    }
-                                }
+                            let msg: Msg = match serde_json::from_slice(&data_msg) {
+                                Ok(msg) => msg,
                                 Err(e) => {
-                                    eprintln!("[{}] Failed to parse message: {:?}", peer.uuid, e);
-                                    let error_reply = format!("Error: Invalid message format").into_bytes();
-                                    let out_frames = vec![client_id_msg.to_vec(), Vec::new(), error_reply];
-                                    if let Err(e) = dealer_guard.send_multipart(out_frames, 0) {
-                                        eprintln!("[{}] send error reply failed: {:?}", peer.uuid, e);
-                                    }
+                                    eprintln!("Failed to parse message: {:?}", e);
+                                    continue;
                                 }
-                            }
+                            };
+
+                            // spawn new thread for concurrent message handling
+                            let peer_clone = Arc::clone(&peer);
+                            tokio::spawn(async move {
+                                let client_id_str = match client_id_msg.as_str() {
+                                    Some(id) => id,
+                                    None => {
+                                        eprintln!("Identity frame invalid: {:?}", client_id_msg);
+                                        return;
+                                    }
+                                };
+
+                                let client_id = match Uuid::from_str(client_id_str) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("error parsing uuid: {e}");
+                                        return;
+                                    }
+                                };
+
+                                if let Err(e) =
+                                    peer_clone.handle_incoming_proxy(&client_id, msg).await
+                                {
+                                    eprintln!("Error handling message from {}: {:?}", client_id, e);
+                                }
+                            });
                         }
                     }
                     Ok(_) => continue, // no events
@@ -488,7 +549,7 @@ impl Peer {
         socket.set_identity(self.uuid.to_string().as_bytes())?;
         socket.connect(seed_addr)?;
 
-        let hello = Msg::HELLO {
+        let hello = Msg::Hello {
             uuid: (self.uuid.clone()),
             addr: (self.addr.clone()),
         };
@@ -507,8 +568,7 @@ impl Peer {
         // block until getting message
         let mut buf: Option<Msg> = None;
         while start.elapsed() < Duration::from_millis(JOIN_TIMEOUT) {
-            // TODO: remover unwrap
-            let router = self.router.lock().unwrap();
+            let router = self.router.lock().expect("poisoned");
 
             let identity = match router.recv_msg(zmq::DONTWAIT) {
                 Ok(msg) => msg,
@@ -564,7 +624,7 @@ impl Peer {
         };
 
         match msg {
-            Msg::GOSSIP { table } => {
+            Msg::Gossip { table } => {
                 let mut membership = self.membership.lock().unwrap();
                 *membership = table;
             }
@@ -581,54 +641,100 @@ impl Peer {
 
     // ---- HANDLE MESSAGES ----
 
-    fn handle_incoming_proxy(&self, client_id: Vec<u8>, msg: Msg) -> Result<()> {
+    async fn handle_incoming_proxy(&self, client_id: &Uuid, msg: Msg) -> Result<()> {
         match msg {
-            Msg::GET_LIST { list_id } => {
-                println!(
-                    "[{}] Received GET_LIST for {} from proxy client",
-                    self.uuid, list_id
-                );
+            Msg::GetList { list } => {
+                println!("[{}] Received GET for {}", self.uuid, list.id);
 
-                let list = {
-                    let storage = self.storage.lock().unwrap();
-                    storage.get_shopping_list(&list_id)?
+                let stored = {
+                    let storage = self.storage.lock().expect("poisoned");
+                    storage.get_shopping_list(&list.id)?
                 };
 
-                let response = Msg::LIST_RESPONSE { list };
-                let reply = serde_json::to_vec(&response)?;
+                match stored {
+                    None => {
+                        eprintln!(
+                            "[{}] Error reading list {}: list not stored",
+                            self.uuid, list.id
+                        );
+                    }
+                    Some(mut l) => {
+                        match self
+                            .send_read_replicate(&list, self.get_replicas(&l.id))
+                            .await
+                        {
+                            Ok(s) => {
+                                l.list.merge(&s.list);
 
-                let dealer_guard = self.proxy_dealer.lock().unwrap();
-                let out_frames = vec![client_id, Vec::new(), reply];
-                dealer_guard.send_multipart(out_frames, 0)?;
+                                {
+                                    let mut storage = self.storage.lock().expect("poisoned");
+                                    storage.write_shopping_list(&l)?;
+                                }
+
+                                let ack = Msg::Ack {
+                                    request_id: "".to_string(),
+                                };
+
+                                self.send_to_proxy(&client_id, &ack);
+
+                                println!("[{}] Read shopping list {}", self.uuid, list.id);
+                            }
+                            Err(e) => {
+                                let nack = Msg::Nack {
+                                    request_id: "".to_string(),
+                                };
+
+                                self.send_to_proxy(&client_id, &nack);
+                                eprintln!("[{}] Error reading list {}: {}", self.uuid, list.id, e);
+                            }
+                        }
+                    }
+                }
             }
 
-            Msg::PUT_LIST { list } => {
-                println!(
-                    "[{}] Received PUT_LIST for {} from proxy client",
-                    self.uuid, list.id
-                );
-                let mut storage = self.storage.lock().unwrap();
-                storage.write_shopping_list(&list)?;
-                
-                let response = format!("Stored shopping list {}", list.id).into_bytes();
-                let dealer_guard = self.proxy_dealer.lock().unwrap();
-                let out_frames = vec![client_id, Vec::new(), response];
-                dealer_guard.send_multipart(out_frames, 0)?;
+            Msg::PutList { list } => {
+                // proxy -> coordinator
+                println!("[{}] Received PUT for {}", self.uuid, list.id);
+
+                match self
+                    .send_write_replicate(&list, self.get_replicas(&list.id))
+                    .await
+                {
+                    Ok(_) => {
+                        // only store if we get replicas to store
+                        let mut storage = self.storage.lock().expect("poisoned");
+                        storage.write_shopping_list(&list)?;
+
+                        let ack = Msg::Ack {
+                            request_id: "".to_string(),
+                        };
+
+                        self.send_to_proxy(&client_id, &ack);
+
+                        println!("[{}] Stored shopping list {}", self.uuid, list.id);
+                    }
+                    Err(e) => {
+                        let nack = Msg::Nack {
+                            request_id: "".to_string(),
+                        };
+
+                        self.send_to_proxy(&client_id, &nack);
+
+                        eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e);
+                    }
+                }
             }
 
             _ => {
-                let error_reply = format!("Error: Unsupported message type for client requests").into_bytes();
-                let dealer_guard = self.proxy_dealer.lock().unwrap();
-                let out_frames = vec![client_id, Vec::new(), error_reply];
-                dealer_guard.send_multipart(out_frames, 0)?;
+                eprintln!("[{}] Error handling incoming proxy message: message {} not supported", self.uuid, msg.name());
             }
         }
         anyhow::Ok(())
     }
 
-    fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
+    async fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
-            Msg::GOSSIP { table } => {
+            Msg::Gossip { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
                 // update our table if it changed
                 let mut membership_guard = self.membership.lock().unwrap();
@@ -642,16 +748,7 @@ impl Peer {
                 self.add_nodes(peer_uuids);
             }
 
-            Msg::PING {} => {
-                println!("[{}] Received PING from {}", self.uuid, identity);
-                self.send_to(identity, &Msg::ACK)?;
-            }
-
-            Msg::ACK => {
-                println!("[{}] Received ACK from {}", self.uuid, identity);
-            }
-
-            Msg::HELLO { uuid, addr } => {
+            Msg::Hello { uuid, addr } => {
                 println!("[{}] Received HELLO from {}", self.uuid, identity);
 
                 {
@@ -677,43 +774,98 @@ impl Peer {
                 let _ = self.send_gossip();
             }
 
-            Msg::GET_LIST { list_id } => {
-                println!(
-                    "[{}] Received GET_LIST for {} from {}",
-                    self.uuid, list_id, identity
-                );
+            Msg::ReplicateList { id, list, write } => {
+                if write {
+                    // WRITE
+                    let storing = {
+                        let mut storage = self.storage.lock().expect("poisoned");
+                        storage.write_shopping_list(&list)
+                    };
 
-                // TODO: tem que haver forma de ver se nodes mandam ACK para este especifico request
-                if let Ok(_) = self.is_coordinator(&list_id) {
-                    let replicas = self.get_replicas(&list_id);
+                    let msg = Msg::Ack { request_id: id };
 
-                    for uuid in replicas {
-                        self.send_to(&uuid, &msg);
+                    match storing {
+                        Ok(()) => {
+                            self.send_to(identity, &msg);
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e)
+                            // do nothing -> if coordinator doesnt receive enough ACKs in X ms it fails
+                        }
                     }
+                } else {
+                    // READ
+                    let stored = {
+                        let mut storage = self.storage.lock().expect("poisoned");
+                        storage.get_shopping_list(&list.id)
+                    };
 
+                    match stored {
+                        Ok(Some(l)) => {
+                            let msg = Msg::AckList {
+                                request_id: id,
+                                list: l,
+                            };
+                            self.send_to(identity, &msg);
+                        }
+                        Ok(None) => {
+                            eprintln!(
+                                "[{}] Error reading list {}: list not stored",
+                                self.uuid, list.id
+                            )
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] Error reading list {}: {}", self.uuid, list.id, e)
+                            // do nothing -> if coordinator doesnt receive enough ACKs in X ms it fails
+                        }
+                    }
                 }
-
-                let list = {
-                    let storage = self.storage.lock().unwrap();
-                    storage.get_shopping_list(&list_id)?
-                };
-
-                let response = Msg::LIST_RESPONSE { list };
-
-                self.send_to(identity, &response)?;
             }
 
-            Msg::PUT_LIST { list } => {
-                println!(
-                    "[{}] Received PUT_LIST for {} from {}",
-                    self.uuid, list.id, identity
-                );
-                let mut storage = self.storage.lock().unwrap();
-                storage.write_shopping_list(&list)?;
-                println!("[{}] Stored shopping list {}", self.uuid, list.id);
+            Msg::Ack { request_id } => {
+                let mut g = self.in_flight.lock().expect("poisoned");
+                let quorom_state = g.get_mut(&request_id);
+
+                match quorom_state {
+                    Some(q) => {
+                        q.increment_received();
+
+                        if q.is_quorom_reached() {
+                            if let Some(tx) = q.responder.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                    None => eprintln!(
+                        "[{}] Error Ack: request with id {} not found",
+                        self.uuid, request_id
+                    ),
+                }
             }
 
-            Msg::MERGE_LIST { list } => {
+            Msg::AckList { request_id, list } => {
+                let mut g = self.in_flight.lock().expect("poisoned");
+                let quorom_state = g.get_mut(&request_id);
+
+                match quorom_state {
+                    Some(q) => {
+                        // adds list to state and +1 received
+                        q.add_list(list);
+
+                        if q.is_quorom_reached() {
+                            if let Some(tx) = q.responder.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                    None => eprintln!(
+                        "[{}] Error AckList {}: request with id {} not found",
+                        self.uuid, list.id, request_id
+                    ),
+                }
+            }
+
+            Msg::MergeList { list } => {
                 println!(
                     "[{}] Received MERGE_LIST for {} from {}",
                     self.uuid, list.id, identity
@@ -737,11 +889,16 @@ impl Peer {
                 }
             }
 
-            Msg::LIST_RESPONSE { .. } => {
+            Msg::ListResponse { .. } => {
                 println!("[{}] Received LIST_RESPONSE from {}", self.uuid, identity);
                 // responses are typically handled by the requester?
             }
+
+            _ => {
+                eprintln!("[{}] Error handling incoming message: message {} not supported", self.uuid, msg.name());
+            }
         }
+
         anyhow::Ok(())
     }
 
@@ -758,17 +915,24 @@ impl Peer {
     fn is_coordinator(&self, list_id: &Uuid) -> Result<bool> {
         let hashring = self.hashring.lock().expect("poisoned");
 
-        let node_id = hashring.get_coordinator(list_id).expect("must have coordinator");
+        let node_id = hashring
+            .get_coordinator(list_id)
+            .expect("must have coordinator");
 
         Ok(node_id == self.uuid.clone())
     }
 
     fn get_replicas(&self, list_id: &Uuid) -> Vec<Uuid> {
-        // NOTE: fn assumes we're the coordinator 
+        // NOTE: fn assumes we're the coordinator
         let hashring = self.hashring.lock().expect("poisoned");
 
-        // skip 'ourselves' 
-        hashring.get_preference_list(list_id).iter().skip(1).cloned().collect()
+        // skip 'ourselves'
+        hashring
+            .get_preference_list(list_id)
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect()
     }
 
     fn get_addresses(&self, ids: Vec<Uuid>) -> Vec<String> {
@@ -777,6 +941,106 @@ impl Peer {
         ids.iter()
             .filter_map(|id| membership.0.get(id).cloned())
             .collect()
+    }
+
+    async fn send_replicate(
+        &self,
+        shopping_list: &ShoppingList,
+        replicas: Vec<Uuid>,
+        write: bool,
+    ) -> Result<()> {
+        let request_id = Uuid::new_v4().to_string();
+        let msg = Msg::ReplicateList {
+            id: request_id.clone(),
+            list: shopping_list.clone(),
+            write,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        let state = QuoromState {
+            needed: if write { WRITE_NODES } else { READ_NODES },
+            received: 0,
+            responder: Some(tx),
+            lists: vec![shopping_list.clone()],
+        };
+
+        {
+            // scope helps -> drops lock auto
+            self.in_flight
+                .lock()
+                .expect("poisoned")
+                .insert(request_id.clone(), state);
+        }
+
+        for replica in replicas {
+            self.send_to(&replica, &msg);
+        }
+
+        let result = timeout(Duration::from_millis(REPLICATE_TIMEOUT), rx).await;
+
+        self.in_flight.lock().expect("poisoned").remove(&request_id);
+
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(_)) => Err(anyhow::anyhow!("quorum aborted")),
+            Err(_) => Err(anyhow::anyhow!("quorum timed out")),
+        }
+    }
+
+    async fn send_write_replicate(
+        &self,
+        shopping_list: &ShoppingList,
+        replicas: Vec<Uuid>,
+    ) -> Result<()> {
+        self.send_replicate(shopping_list, replicas, true).await
+    }
+
+    async fn send_read_replicate(
+        &self,
+        shopping_list: &ShoppingList,
+        replicas: Vec<Uuid>,
+    ) -> Result<ShoppingList> {
+        let request_id = Uuid::new_v4().to_string();
+        let msg = Msg::ReplicateList {
+            id: request_id.clone(),
+            list: shopping_list.clone(),
+            write: false,
+        };
+
+        let (tx, rx) = oneshot::channel();
+
+        let state = QuoromState {
+            needed: READ_NODES,
+            received: 0,
+            responder: Some(tx),
+            lists: vec![shopping_list.clone()],
+        };
+
+        self.in_flight
+            .lock()
+            .expect("poisoned")
+            .insert(request_id.clone(), state);
+
+        for replica in replicas {
+            self.send_to(&replica, &msg);
+        }
+
+        let result = timeout(Duration::from_millis(REPLICATE_TIMEOUT), rx).await;
+
+        let quorom_state = self.in_flight.lock().expect("poisoned").remove(&request_id);
+
+        match result {
+            Ok(Ok(())) => {
+                if let Some(q) = quorom_state {
+                    q.merge_lists()
+                } else {
+                    Err(anyhow::anyhow!("quorum state missing"))
+                }
+            }
+            Ok(Err(_)) => Err(anyhow::anyhow!("quorum aborted")),
+            Err(_) => Err(anyhow::anyhow!("quorum timed out")),
+        }
     }
 
     // ---- FAILURE DETECTION ----
@@ -788,7 +1052,11 @@ impl Peer {
             "[{}] Marked peer {} as failed (consecutive failures: {})",
             self.uuid,
             uuid,
-            failure_table.0.get(uuid).map(|f| f.consecutive_failures).unwrap_or(0)
+            failure_table
+                .0
+                .get(uuid)
+                .map(|f| f.consecutive_failures)
+                .unwrap_or(0)
         );
     }
 

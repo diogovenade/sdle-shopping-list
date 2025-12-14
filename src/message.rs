@@ -21,28 +21,33 @@ pub enum Response {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Msg {
-    HELLO { uuid: Uuid, addr: String },
-    GOSSIP { table: MembershipTable },
-    PING,
-    ACK,
+    Hello { uuid: Uuid, addr: String },
+    Gossip { table: MembershipTable },  
+
+    Ack { request_id: String },
+    Nack {request_id: String },
+    AckList {request_id: String, list: ShoppingList},
     // Shopping list operations
-    GET_LIST { list_id: Uuid },
-    PUT_LIST { list: ShoppingList },
-    MERGE_LIST { list: ShoppingList },
-    LIST_RESPONSE { list: Option<ShoppingList> },
+    GetList { list: ShoppingList },
+    PutList { list: ShoppingList },
+    ReplicateList {id: String, list: ShoppingList, write: bool},
+    MergeList { list: ShoppingList },
+    ListResponse { list: Option<ShoppingList> },
 }
 
 impl Msg {
     pub fn name(&self) -> &'static str {
         match self {
-            Msg::HELLO { .. } => "HELLO",
-            Msg::GOSSIP { .. } => "GOSSIP",
-            Msg::PING => "PING",
-            Msg::ACK => "ACK",
-            Msg::GET_LIST { .. } => "GET_LIST",
-            Msg::PUT_LIST { .. } => "PUT_LIST",
-            Msg::MERGE_LIST { .. } => "MERGE_LIST",
-            Msg::LIST_RESPONSE { .. } => "LIST_RESPONSE",
+            Msg::Hello { .. } => "HELLO",
+            Msg::Gossip { .. } => "GOSSIP",
+            Msg::Ack { .. } => "ACK",
+            Msg::Nack { .. } => "NACK",
+            Msg::GetList { .. } => "GET_LIST",
+            Msg::PutList { .. } => "PUT_LIST",
+            Msg::MergeList { .. } => "MERGE_LIST",
+            Msg::ListResponse { .. } => "LIST_RESPONSE",
+            Msg::ReplicateList {..} => "REPLICATE",
+            Msg::AckList { .. } => "AckList",
         }
     }
 }
