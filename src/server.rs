@@ -666,10 +666,13 @@ impl Peer {
                         let _ = self.handle_incoming_put(&client_id, &list).await;
                     }
                     Some(mut l) => {
-                        match self
-                            .send_read_replicate(&list, self.get_replicas(&l.id))
-                            .await
-                        {
+                        let replicas = self.get_replicas(&list.id);
+
+                        if replicas.is_empty() {
+                            return Err(anyhow::anyhow!("no replicas found in hashring"));
+                        }
+
+                        match self.send_read_replicate(&list, replicas).await {
                             Ok(s) => {
                                 l.list.merge(&s.list);
 
@@ -857,7 +860,8 @@ impl Peer {
             } => {
                 {
                     // just to be sure
-                    self.storage
+                    let _ = self
+                        .storage
                         .lock()
                         .expect("poisoned")
                         .write_shopping_list_handoff(&list, &original_node);
@@ -910,10 +914,13 @@ impl Peer {
     }
 
     async fn handle_incoming_put(&self, client_id: &[u8], list: &ShoppingList) -> Result<()> {
-        match self
-            .send_write_replicate(&list, self.get_replicas(&list.id))
-            .await
-        {
+        let replicas = self.get_replicas(&list.id);
+
+        if replicas.is_empty() {
+            return Err(anyhow::anyhow!("no replicas found in hashring"));
+        }
+
+        match self.send_write_replicate(&list, replicas).await {
             Ok(_) => {
                 // only store if we get replicas to store
                 let mut storage = self.storage.lock().expect("poisoned");

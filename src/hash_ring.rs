@@ -112,6 +112,16 @@ impl HashRing {
 
         None
     }
+
+    pub fn print_ring(&self) {
+        let nodes: Vec<String> = self
+            .ring
+            .values()
+            .map(|id| id.to_string()[..8].to_string())
+            .collect();
+
+        println!("HASH-RING: {}", nodes.join(" -> "));
+    }
 }
 
 #[cfg(test)]
