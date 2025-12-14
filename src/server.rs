@@ -21,8 +21,9 @@ use crate::storage::ServerStorage;
 
 const GOSSIP_INTERVAL: u64 = 500; // ms
 const JOIN_TIMEOUT: u64 = 1500;
-const FAILURE_TIMEOUT: u64 = 1000;
+const FAILURE_DETECTION_INTERVAL: u64 = 1000;
 const REPLICATE_TIMEOUT: u64 = 3000;
+const HINTED_HANDOFF_INTERVAL: u64 = 3000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<Uuid, String>);
@@ -44,7 +45,7 @@ impl DealerMap {
 #[derive(Debug, Clone)]
 pub struct PeerFailureInfo {
     pub last_failure: Instant,
-    pub consecutive_failures: u32,
+    pub failed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -62,11 +63,11 @@ impl FailureTable {
             .entry(server_id)
             .and_modify(|e| {
                 e.last_failure = now;
-                e.consecutive_failures += 1;
+                e.failed = true;
             })
             .or_insert(PeerFailureInfo {
                 last_failure: now,
-                consecutive_failures: 1,
+                failed: true,
             });
     }
 
@@ -78,11 +79,7 @@ impl FailureTable {
         match self.0.get(server_id) {
             None => true,
             Some(info) => {
-                // consider unavailable if more than 3 consecutive failures, OR failed within last FAILURE_TIMEOUT ms
-                if info.consecutive_failures > 3 {
-                    return false;
-                }
-                info.last_failure.elapsed() > Duration::from_millis(FAILURE_TIMEOUT)
+                return info.failed;
             }
         }
     }
@@ -254,7 +251,7 @@ impl Peer {
             }
             Err(e) => {
                 self.mark_peer_failed(uuid);
-                self.close_conn(uuid, socket).ok(); // Try to close, ignore errors
+                let _ = self.close_conn(uuid, socket);
                 return Err(e.into());
             }
         }
@@ -726,7 +723,11 @@ impl Peer {
             }
 
             _ => {
-                eprintln!("[{}] Error handling incoming proxy message: message {} not supported", self.uuid, msg.name());
+                eprintln!(
+                    "[{}] Error handling incoming proxy message: message {} not supported",
+                    self.uuid,
+                    msg.name()
+                );
             }
         }
         anyhow::Ok(())
@@ -865,6 +866,24 @@ impl Peer {
                 }
             }
 
+            Msg::Handoff {
+                request_id,
+                list,
+                original_node,
+            } => {
+                {
+                    // just to be sure
+                    self.storage
+                        .lock()
+                        .expect("poisoned")
+                        .write_shopping_list_handoff(&list, &original_node);
+                }
+
+                let msg = Msg::Ack { request_id };
+
+                self.send_to(identity, &msg);
+            }
+
             Msg::MergeList { list } => {
                 println!(
                     "[{}] Received MERGE_LIST for {} from {}",
@@ -895,11 +914,52 @@ impl Peer {
             }
 
             _ => {
-                eprintln!("[{}] Error handling incoming message: message {} not supported", self.uuid, msg.name());
+                eprintln!(
+                    "[{}] Error handling incoming message: message {} not supported",
+                    self.uuid,
+                    msg.name()
+                );
             }
         }
 
         anyhow::Ok(())
+    }
+
+    // ---- HINTED-HANDOFF ----
+
+    async fn hinted_handoff(peer: SharedPeer) {
+        let interval = Duration::from_millis(HINTED_HANDOFF_INTERVAL);
+
+        loop {
+            sleep(interval).await;
+
+            let peer_clone = Arc::clone(&peer);
+
+            let result = tokio::task::spawn_blocking(move || {
+                let handoffs = peer_clone
+                    .storage
+                    .lock()
+                    .expect("poisoned")
+                    .get_hinted_handoffs()?;
+
+                for (dest, list) in handoffs {
+                    let msg = Msg::ReplicateList {
+                        id: Uuid::new_v4().to_string(), // no need for quorom so random uuid is ok
+                        list,
+                        write: true,
+                    };
+
+                    let _ = peer_clone.send_to(&dest, &msg);
+                }
+
+                anyhow::Ok(())
+            })
+            .await;
+
+            if let Err(e) = result {
+                eprintln!("Hinted handoff blocking task failed: {:?}", e);
+            }
+        }
     }
 
     // ---- UTILITIES ----
@@ -973,8 +1033,26 @@ impl Peer {
                 .insert(request_id.clone(), state);
         }
 
-        for replica in replicas {
-            self.send_to(&replica, &msg);
+        let last = replicas.last().expect("no replicas found");
+
+        for replica in &replicas {
+            if let Err(_) = self.send_to(&replica, &msg) {
+                let next = match self.get_next_available_node(last) {
+                    Ok(node) => node,
+                    Err(_) => {
+                        // no fallback node → quorum will fail
+                        break;
+                    }
+                };
+
+                let handoff_msg = Msg::Handoff {
+                    request_id: request_id.clone(),
+                    list: shopping_list.clone(),
+                    original_node: replica.clone(),
+                };
+
+                let _ = self.send_to(&next, &handoff_msg);
+            }
         }
 
         let result = timeout(Duration::from_millis(REPLICATE_TIMEOUT), rx).await;
@@ -1043,21 +1121,63 @@ impl Peer {
         }
     }
 
+    fn get_next_available_node(&self, start: &Uuid) -> Result<Uuid> {
+        let s = start.clone();
+        let mut current = s;
+
+        loop {
+            let next = {
+                let ring = self.hashring.lock().expect("poisoned");
+                ring.next_node(&current)
+            }
+            .ok_or_else(|| anyhow::anyhow!("no available nodes"))?;
+
+            if self.is_peer_available(&next) {
+                return Ok(next.clone());
+            }
+
+            if next == s {
+                return Err(anyhow::anyhow!("no available nodes"));
+            }
+
+            current = next;
+        }
+    }
+
     // ---- FAILURE DETECTION ----
+
+    fn send_ping_to(&self, uuid: &Uuid) {
+        let msg = Msg::Ping;
+        self.send_to(uuid, &msg);
+    }
+
+    async fn failure_detection(peer: SharedPeer) {
+        let interval = Duration::from_millis(FAILURE_DETECTION_INTERVAL);
+
+        loop {
+            sleep(interval).await;
+            let peer_clone = Arc::clone(&peer);
+
+            let result = tokio::task::spawn_blocking(move || {
+                let table = peer_clone.failure.lock().expect("poisoned");
+
+                for uuid in table.0.keys() {
+                    peer_clone.send_ping_to(uuid);
+                }
+            })
+            .await;
+
+            match result {
+                Ok(_) => {}
+                Err(e) => eprintln!("Blocking failure detection task failed to execute: {:?}", e),
+            }
+        }
+    }
 
     fn mark_peer_failed(&self, uuid: &Uuid) {
         let mut failure_table = self.failure.lock().expect("poisoned");
         failure_table.mark_failure(*uuid);
-        eprintln!(
-            "[{}] Marked peer {} as failed (consecutive failures: {})",
-            self.uuid,
-            uuid,
-            failure_table
-                .0
-                .get(uuid)
-                .map(|f| f.consecutive_failures)
-                .unwrap_or(0)
-        );
+        eprintln!("[{}] Marked peer {} as failed", self.uuid, uuid);
     }
 
     fn clear_peer_failure(&self, uuid: &Uuid) {
@@ -1082,17 +1202,5 @@ impl Peer {
         // Check if peer has recent failures
         let failure_table = self.failure.lock().expect("poisoned");
         failure_table.is_available(uuid)
-    }
-
-    #[allow(dead_code)]
-    fn get_failure_count(&self) -> usize {
-        let failure_table = self.failure.lock().expect("poisoned");
-        failure_table.0.len()
-    }
-
-    #[allow(dead_code)]
-    fn get_failed_peers(&self) -> Vec<Uuid> {
-        let failure_table = self.failure.lock().expect("poisoned");
-        failure_table.0.keys().copied().collect()
     }
 }

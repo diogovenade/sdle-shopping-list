@@ -5,7 +5,7 @@ use uuid::Uuid;
 pub const VNODES: usize = 3;
 pub const REPLICAS: usize = 3;
 pub const WRITE_NODES: usize = 2; // minimum number of nodes that must participate in a write
-pub const READ_NODES: usize = 2;  // minimum number of nodes that must participate in a read
+pub const READ_NODES: usize = 2; // minimum number of nodes that must participate in a read
 
 pub struct HashRing {
     ring: BTreeMap<u128, Uuid>, // hash -> server_id
@@ -81,6 +81,36 @@ impl HashRing {
         hasher.update(key.as_bytes());
         let result = hasher.finalize();
         u128::from_be_bytes(result.into())
+    }
+
+    pub fn next_node(&self, node_id: &Uuid) -> Option<Uuid> {
+        if self.ring.is_empty() {
+            return None;
+        }
+
+        // Collect all virtual node hashes for this physical node
+        let mut vnodes: Vec<u128> = self
+            .ring
+            .iter()
+            .filter_map(|(hash, id)| if id == node_id { Some(*hash) } else { None })
+            .collect();
+
+        if vnodes.is_empty() {
+            return None;
+        }
+
+        vnodes.sort_unstable();
+        let start = vnodes[0];
+
+        let iter = self.ring.range((start + 1)..).chain(self.ring.iter());
+
+        for (_, next_id) in iter {
+            if next_id != node_id {
+                return Some(*next_id);
+            }
+        }
+
+        None
     }
 }
 
