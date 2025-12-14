@@ -666,10 +666,13 @@ impl Peer {
                         let _ = self.handle_incoming_put(&client_id, &list).await;
                     }
                     Some(mut l) => {
-                        match self
-                            .send_read_replicate(&list, self.get_replicas(&l.id))
-                            .await
-                        {
+                        let replicas = self.get_replicas(&list.id);
+
+                        if replicas.is_empty() {
+                            return Err(anyhow::anyhow!("no replicas found in hashring"));
+                        }
+
+                        match self.send_read_replicate(&list, replicas).await {
                             Ok(s) => {
                                 l.list.merge(&s.list);
 
@@ -857,7 +860,8 @@ impl Peer {
             } => {
                 {
                     // just to be sure
-                    self.storage
+                    let _ = self
+                        .storage
                         .lock()
                         .expect("poisoned")
                         .write_shopping_list_handoff(&list, &original_node);
@@ -910,10 +914,13 @@ impl Peer {
     }
 
     async fn handle_incoming_put(&self, client_id: &[u8], list: &ShoppingList) -> Result<()> {
-        match self
-            .send_write_replicate(&list, self.get_replicas(&list.id))
-            .await
-        {
+        let replicas = self.get_replicas(&list.id);
+
+        if replicas.is_empty() {
+            return Err(anyhow::anyhow!("no replicas found in hashring"));
+        }
+
+        match self.send_write_replicate(&list, replicas).await {
             Ok(_) => {
                 // only store if we get replicas to store
                 let mut storage = self.storage.lock().expect("poisoned");
@@ -961,11 +968,26 @@ impl Peer {
                 for (dest, list) in handoffs {
                     let msg = Msg::ReplicateList {
                         id: Uuid::new_v4().to_string(), // no need for quorom so random uuid is ok
-                        list,
+                        list: list.clone(),
                         write: true,
                     };
 
-                    let _ = peer_clone.send_to(&dest, &msg);
+                    match peer_clone.send_to(&dest, &msg) {
+                        Ok(_) => {
+                            // if ccan send delete from DB
+                            let _ = peer_clone
+                                .storage
+                                .lock()
+                                .expect("poisoned")
+                                .delete_shopping_list(&list.id);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[{}] Failed sending hinted handoff data: {:?}",
+                                peer_clone.uuid, e
+                            );
+                        }
+                    }
                 }
 
                 anyhow::Ok(())
@@ -973,7 +995,10 @@ impl Peer {
             .await;
 
             if let Err(e) = result {
-                eprintln!("Hinted handoff blocking task failed: {:?}", e);
+                eprintln!(
+                    "[{}] Hinted handoff blocking task failed: {:?}",
+                    peer.uuid, e
+                );
             }
         }
     }

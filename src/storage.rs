@@ -731,4 +731,17 @@ impl ServerStorage {
 
         Ok(rows)
     }
+
+    pub fn delete_shopping_list(&mut self, shopping_list_id: &Uuid) -> Result<()> {
+        let tx = self.db_conn.transaction()?;
+        let hash = HashRing::hash(&shopping_list_id.to_string()).to_be_bytes();
+
+        tx.execute(
+            "DELETE FROM shopping_lists WHERE id = ?1",
+            params![hash.as_slice()],
+        )?;
+
+        tx.commit()?;
+        Ok(())
+    }
 }
