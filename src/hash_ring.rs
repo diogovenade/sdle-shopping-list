@@ -64,6 +64,31 @@ impl HashRing {
         preference_list
     }
 
+    pub fn get_preference_list_hash(&self, hash: u128) -> Vec<Uuid> {
+        if self.ring.is_empty() {
+            return vec![];
+        }
+
+        let mut preference_list = Vec::new();
+        let mut seen_servers = HashSet::new();
+
+        let iter = self.ring.range(hash..).chain(self.ring.iter());
+
+        for (_, node_id) in iter {
+            // Only add distinct physical nodes
+            if !seen_servers.contains(node_id) {
+                preference_list.push(*node_id);
+                seen_servers.insert(*node_id);
+
+                if preference_list.len() >= self.replicas {
+                    break;
+                }
+            }
+        }
+
+        preference_list
+    }
+
     pub fn get_coordinator(&self, list_id: &Uuid) -> Option<Uuid> {
         self.get_preference_list(list_id).first().copied()
     }
@@ -111,6 +136,59 @@ impl HashRing {
         }
 
         None
+    }
+
+    pub fn prev_node_hash(&self, node_id: &Uuid) -> Option<u128> {
+        if self.ring.is_empty() {
+            return None;
+        }
+
+        let vnodes: Vec<u128> = self
+            .ring
+            .iter()
+            .filter_map(|(hash, id)| if id == node_id { Some(*hash) } else { None })
+            .collect();
+
+        if vnodes.is_empty() {
+            return None;
+        }
+
+        let node_hash = vnodes[0];
+
+        // largest hash smaller than node_hash
+        let prev_hash = self
+            .ring
+            .range(..node_hash)
+            .next_back()
+            .map(|(h, _)| *h)
+            .or_else(|| self.ring.iter().next_back().map(|(h, _)| *h));
+
+        prev_hash
+    }
+
+    pub fn get_predecessors(&self, node_id: &Uuid) -> Vec<Uuid> {
+        if self.ring.is_empty() {
+            return vec![];
+        }
+
+        // Collect all distinct physical nodes except node_id
+        let mut seen = HashSet::new();
+        let mut predecessors = Vec::new();
+
+        // Iterate the ring in reverse (counter-clockwise)
+        for (_, id) in self.ring.iter().rev() {
+            if id != node_id && !seen.contains(id) {
+                predecessors.push(*id);
+                seen.insert(*id);
+
+                // so precisamos de andar ate dois antes
+                if predecessors.len() >= self.replicas {
+                    break;
+                }
+            }
+        }
+
+        predecessors
     }
 
     pub fn print_ring(&self) {
