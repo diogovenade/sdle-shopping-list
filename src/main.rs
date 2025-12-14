@@ -112,8 +112,9 @@ async fn main() -> Result<()> {
             Peer::start(Arc::clone(&sp2)).await;
             Peer::start(Arc::clone(&sp3)).await;
 
-            tokio::signal::ctrl_c().await?;
-            println!("Shutting down");
+            loop {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
         "proxy" => {
             let frontend_addr = "tcp://127.0.0.1:5555";
@@ -143,10 +144,15 @@ async fn main() -> Result<()> {
 
             let sp: SharedPeer = Arc::new(peer);
 
+            if let Err(e) = sp.join(&seed_addr) {
+                eprintln!("{} failed to join: {}", sp.uuid, e);
+            }
+
             Peer::start(Arc::clone(&sp)).await;
 
-            tokio::signal::ctrl_c().await?;
-            println!("Shutting down");
+            loop {
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         "remove-peer" => {
