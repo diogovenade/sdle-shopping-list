@@ -23,7 +23,7 @@ pub enum Response {
 pub enum Msg {
     Hello { uuid: Uuid, addr: String },
     Gossip { table: MembershipTable },  
-
+    Ping,
     Ack { request_id: String },
     Nack {request_id: String },
     AckList {request_id: String, list: ShoppingList},
@@ -33,6 +33,7 @@ pub enum Msg {
     ReplicateList {id: String, list: ShoppingList, write: bool},
     MergeList { list: ShoppingList },
     ListResponse { list: Option<ShoppingList> },
+    Handoff {request_id: String, list: ShoppingList, original_node: Uuid}
 }
 
 impl Msg {

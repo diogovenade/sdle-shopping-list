@@ -1,9 +1,9 @@
-use anyhow::Result;
-use uuid::Uuid;
-use zmq::{Context, Socket, SocketType, POLLIN};
+use crate::crdt::ShoppingList;
 use crate::hash_ring::{HashRing, REPLICAS, VNODES};
 use crate::message::Msg;
-use crate::crdt::{ShoppingList};
+use anyhow::Result;
+use uuid::Uuid;
+use zmq::{Context, POLLIN, Socket, SocketType};
 
 pub struct Proxy {
     context: Context,
@@ -53,11 +53,15 @@ impl Proxy {
                 let payload = &msg[2];
 
                 let server_id = match serde_json::from_slice::<Msg>(payload) {
-                    Ok(Msg::GetList { list: ShoppingList { id: list_id, .. } }) |
-                    Ok(Msg::PutList { list: ShoppingList { id: list_id, .. } }) |
-                    Ok(Msg::MergeList { list: ShoppingList { id: list_id, .. } }) => {
-                        self.ring.get_coordinator(&list_id)
-                    }
+                    Ok(Msg::GetList {
+                        list: ShoppingList { id: list_id, .. },
+                    })
+                    | Ok(Msg::PutList {
+                        list: ShoppingList { id: list_id, .. },
+                    })
+                    | Ok(Msg::MergeList {
+                        list: ShoppingList { id: list_id, .. },
+                    }) => self.ring.get_coordinator(&list_id),
                     _ => None,
                 };
 
