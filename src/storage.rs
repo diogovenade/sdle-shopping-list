@@ -583,8 +583,23 @@ impl ServerStorage {
     }
 
     pub fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
-        let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
-        let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
+        let data: Vec<u8> = serde_json::to_vec(&shopping_list)?;
+
+        let stored = match self.get_shopping_list(&shopping_list.id) {
+            Ok(Some(s)) => Some(s),
+            Ok(None) => None,
+            Err(_) => None,
+        };
+
+        let new_shopping_list = match stored {
+            Some(mut s) => {
+                s.list.merge(&shopping_list.list);
+                s
+            }
+            None => shopping_list.clone(),
+        };
+
+        let hash = HashRing::hash(&new_shopping_list.id.to_string()).to_be_bytes();
 
         let tx = self.db_conn.transaction()?;
 
@@ -604,8 +619,23 @@ impl ServerStorage {
         shopping_list: &ShoppingList,
         server_id: &Uuid,
     ) -> Result<()> {
-        let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
-        let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
+        let data: Vec<u8> = serde_json::to_vec(&shopping_list)?;
+
+        let stored = match self.get_shopping_list(&shopping_list.id) {
+            Ok(Some(s)) => Some(s),
+            Ok(None) => None,
+            Err(_) => None,
+        };
+
+        let new_shopping_list = match stored {
+            Some(mut s) => {
+                s.list.merge(&shopping_list.list);
+                s
+            }
+            None => shopping_list.clone(),
+        };
+
+        let hash = HashRing::hash(&new_shopping_list.id.to_string()).to_be_bytes();
 
         let tx = self.db_conn.transaction()?;
 
