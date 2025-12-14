@@ -74,8 +74,8 @@ impl Client {
         }
     }
 
-    fn fetch_list(&self, list_id: Uuid) -> Result<Option<ShoppingList>> {
-        let msg = Msg::GET_LIST { list_id };
+    fn fetch_list(&self, list: &ShoppingList) -> Result<Option<ShoppingList>> {
+        let msg = Msg::GetList { list: list.clone() };
         let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
 
         self.socket.send(payload, 0)?;
@@ -84,13 +84,13 @@ impl Client {
         let response: Msg = serde_json::from_slice(&reply)?;
 
         match response {
-            Msg::LIST_RESPONSE { list } => Ok(list),
+            Msg::ListResponse { list } => Ok(list),
             _ => anyhow::bail!("Unexpected response from server"),
         }
     }
 
     fn send_list(&self, list: &ShoppingList) -> Result<()> {
-        let msg = Msg::PUT_LIST { list: list.clone() };
+        let msg = Msg::PutList { list: list.clone() };
         let payload = serde_json::to_vec(&msg)?;
 
         self.socket.send(payload, 0)?;
@@ -103,7 +103,7 @@ impl Client {
 
     pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
         let local_list = self.storage_handler.read_shopping_list(list_id)?;
-        let remote_list = self.fetch_list(list_id)?;
+        let remote_list = self.fetch_list(&local_list)?;
 
         let merged_list = if let Some(remote) = remote_list {
             let mut merged = local_list;
