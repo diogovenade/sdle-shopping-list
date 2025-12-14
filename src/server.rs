@@ -19,7 +19,7 @@ use crate::hash_ring::{HashRing, READ_NODES, REPLICAS, VNODES, WRITE_NODES};
 use crate::message::Msg;
 use crate::storage::ServerStorage;
 
-const GOSSIP_INTERVAL: u64 = 500; // ms
+const GOSSIP_INTERVAL: u64 = 1000; // ms
 const JOIN_TIMEOUT: u64 = 1500;
 const FAILURE_DETECTION_INTERVAL: u64 = 1000;
 const REPLICATE_TIMEOUT: u64 = 3000;
@@ -262,12 +262,11 @@ impl Peer {
         Ok(())
     }
 
-    fn send_to_proxy(&self, client_id: &Uuid, msg: &Msg) -> Result<()> {
-        let client_id_bytes = client_id.as_bytes();
+    fn send_to_proxy(&self, client_id: &[u8], msg: &Msg) -> Result<()> {
         let empty = b"";
         let data = serde_json::to_vec(msg)?;
 
-        let out_frames: Vec<&[u8]> = vec![client_id_bytes, empty, &data];
+        let out_frames: Vec<&[u8]> = vec![client_id, empty, &data];
 
         let dealer_guard = self.proxy_dealer.lock().expect("poisoned");
 
@@ -397,7 +396,7 @@ impl Peer {
                                 let sender_uuid_str = match identity_msg.as_str() {
                                     Some(id) => id,
                                     None => {
-                                        eprintln!("Identity frame invalid: {:?}", identity_msg);
+                                        eprintln!("Peer identity frame invalid: {:?}", identity_msg);
                                         return;
                                     }
                                 };
@@ -484,29 +483,31 @@ impl Peer {
                                 }
                             };
 
+                            let client_id = client_id_msg.to_vec();
+
                             // spawn new thread for concurrent message handling
                             let peer_clone = Arc::clone(&peer);
                             tokio::spawn(async move {
-                                let client_id_str = match client_id_msg.as_str() {
-                                    Some(id) => id,
-                                    None => {
-                                        eprintln!("Identity frame invalid: {:?}", client_id_msg);
-                                        return;
-                                    }
-                                };
+                                // let client_id = match client_id_msg.to_vec() {
+                                //     Some(id) => id,
+                                //     None => {
+                                //         eprintln!("Proxy identity frame invalid: {:?}", client_id_msg.as_str());
+                                //         return;
+                                //     }
+                                // };
 
-                                let client_id = match Uuid::from_str(client_id_str) {
-                                    Ok(s) => s,
-                                    Err(e) => {
-                                        eprintln!("error parsing uuid: {e}");
-                                        return;
-                                    }
-                                };
+                                // let client_id = match Uuid::from_str(client_id_str) {
+                                //     Ok(s) => s,
+                                //     Err(e) => {
+                                //         eprintln!("error parsing uuid: {e}");
+                                //         return;
+                                //     }
+                                // };
 
                                 if let Err(e) =
                                     peer_clone.handle_incoming_proxy(&client_id, msg).await
                                 {
-                                    eprintln!("Error handling message from {}: {:?}", client_id, e);
+                                    eprintln!("Error handling message from {:?}: {:?}", client_id, e);
                                 }
                             });
                         }
@@ -638,7 +639,7 @@ impl Peer {
 
     // ---- HANDLE MESSAGES ----
 
-    async fn handle_incoming_proxy(&self, client_id: &Uuid, msg: Msg) -> Result<()> {
+    async fn handle_incoming_proxy(&self, client_id: &Vec<u8>, msg: Msg) -> Result<()> {
         match msg {
             Msg::GetList { list } => {
                 println!("[{}] Received GET for {}", self.uuid, list.id);
