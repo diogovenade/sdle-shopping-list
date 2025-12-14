@@ -1,11 +1,13 @@
 use anyhow::Result;
-use tokio::time::sleep;
+use tokio::time::error::Elapsed;
+use tokio::time::{sleep, timeout};
 use uuid::Uuid;
 use zmq::{Context, Error, PollItem, SNDMORE, Socket, SocketType};
 
 use rand::seq::{IndexedRandom, SliceRandom};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::hash::Hash;
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -13,13 +15,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::crdt::{Mergeable, ShoppingList};
-use crate::hash_ring::{HashRing, REPLICAS, VNODES};
+use crate::hash_ring::{HashRing, READ_NODES, REPLICAS, VNODES, WRITE_NODES};
 use crate::message::Msg;
 use crate::storage::ServerStorage;
 
 const GOSSIP_INTERVAL: u64 = 500; // ms
 const JOIN_TIMEOUT: u64 = 1500;
 const FAILURE_TIMEOUT: u64 = 1000;
+const REPLICATE_TIMEOUT: u64 = 3000; 
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +88,42 @@ impl FailureTable {
     }
 }
 
+// for storing requests information
+struct QuoromState {
+    needed: usize, 
+    received: usize, 
+    pub responder: Option<oneshot::Sender<()>>,
+    lists: Vec<ShoppingList>
+}
+
+impl QuoromState {
+    pub fn is_quorom_reached(&self) -> bool{
+        self.received >= self.needed
+    }
+
+    pub fn merge_lists(&self) -> Result<ShoppingList> {
+        let mut merged = match self.lists.first() {
+            Some(list) => list.clone(),
+            None => return Err(anyhow::anyhow!("No shopping lists to merge")),
+        };
+
+        for list in self.lists.iter().skip(1) {
+            merged.list.merge(&list.list);
+        }
+
+        Ok(merged)
+    }
+
+    pub fn add_list(&mut self, list: ShoppingList) {
+        self.received += 1;
+        self.lists.push(list);
+    }
+
+    pub fn increment_received(&mut self) {
+        self.received += 1;
+    }
+}
+
 
 pub struct Peer {
     pub uuid: Uuid, // NOTE: apparently the server id is the dealer id of the one connected to the proxy
@@ -97,7 +136,8 @@ pub struct Peer {
     proxy_dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
     hashring: Mutex<HashRing>,          // stores hashring
-    failure: Mutex<FailureTable>        // stores nodes which are failing
+    failure: Mutex<FailureTable>,        // stores nodes which are failing
+    in_flight: Mutex<HashMap<String, QuoromState>> // unresolved requests
 }
 
 pub type SharedPeer = Arc<Peer>;
@@ -126,6 +166,7 @@ impl Peer {
 
         let failure = FailureTable::new();
 
+        let in_flight = HashMap::<String, QuoromState>::new();
 
         anyhow::Ok(Self {
             ctx,
@@ -137,6 +178,7 @@ impl Peer {
             storage: Mutex::new(storage),
             hashring: Mutex::new(hashring),
             failure: Mutex::new(failure),
+            in_flight: Mutex::new(in_flight)
         })
     }
 
@@ -230,7 +272,7 @@ impl Peer {
             table.clone()
         };
 
-        let msg = Msg::GOSSIP { table };
+        let msg = Msg::Gossip { table };
 
         let peers: Vec<Uuid> = {
             let table = self.membership.lock().unwrap();
@@ -268,7 +310,7 @@ impl Peer {
             table.clone()
         };
 
-        let msg = Msg::GOSSIP {
+        let msg = Msg::Gossip {
             table: table_snapshot,
         };
 
@@ -488,7 +530,7 @@ impl Peer {
         socket.set_identity(self.uuid.to_string().as_bytes())?;
         socket.connect(seed_addr)?;
 
-        let hello = Msg::HELLO {
+        let hello = Msg::Hello {
             uuid: (self.uuid.clone()),
             addr: (self.addr.clone()),
         };
@@ -564,7 +606,7 @@ impl Peer {
         };
 
         match msg {
-            Msg::GOSSIP { table } => {
+            Msg::Gossip { table } => {
                 let mut membership = self.membership.lock().unwrap();
                 *membership = table;
             }
@@ -583,7 +625,7 @@ impl Peer {
 
     fn handle_incoming_proxy(&self, client_id: Vec<u8>, msg: Msg) -> Result<()> {
         match msg {
-            Msg::GET_LIST { list_id } => {
+            Msg::GetList { list_id } => {
                 println!(
                     "[{}] Received GET_LIST for {} from proxy client",
                     self.uuid, list_id
@@ -594,7 +636,7 @@ impl Peer {
                     storage.get_shopping_list(&list_id)?
                 };
 
-                let response = Msg::LIST_RESPONSE { list };
+                let response = Msg::ListResponse { list } { list };
                 let reply = serde_json::to_vec(&response)?;
 
                 let dealer_guard = self.proxy_dealer.lock().unwrap();
@@ -602,7 +644,7 @@ impl Peer {
                 dealer_guard.send_multipart(out_frames, 0)?;
             }
 
-            Msg::PUT_LIST { list } => {
+            Msg::PutList { list } => {
                 println!(
                     "[{}] Received PUT_LIST for {} from proxy client",
                     self.uuid, list.id
@@ -626,9 +668,9 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
+    async fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
-            Msg::GOSSIP { table } => {
+            Msg::Gossip { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
                 // update our table if it changed
                 let mut membership_guard = self.membership.lock().unwrap();
@@ -642,16 +684,7 @@ impl Peer {
                 self.add_nodes(peer_uuids);
             }
 
-            Msg::PING {} => {
-                println!("[{}] Received PING from {}", self.uuid, identity);
-                self.send_to(identity, &Msg::ACK)?;
-            }
-
-            Msg::ACK => {
-                println!("[{}] Received ACK from {}", self.uuid, identity);
-            }
-
-            Msg::HELLO { uuid, addr } => {
+            Msg::Hello { uuid, addr } => {
                 println!("[{}] Received HELLO from {}", self.uuid, identity);
 
                 {
@@ -677,43 +710,155 @@ impl Peer {
                 let _ = self.send_gossip();
             }
 
-            Msg::GET_LIST { list_id } => {
+            Msg::GetList { list } => {
                 println!(
                     "[{}] Received GET_LIST for {} from {}",
-                    self.uuid, list_id, identity
-                );
-
-                // TODO: tem que haver forma de ver se nodes mandam ACK para este especifico request
-                if let Ok(_) = self.is_coordinator(&list_id) {
-                    let replicas = self.get_replicas(&list_id);
-
-                    for uuid in replicas {
-                        self.send_to(&uuid, &msg);
-                    }
-
-                }
-
-                let list = {
-                    let storage = self.storage.lock().unwrap();
-                    storage.get_shopping_list(&list_id)?
-                };
-
-                let response = Msg::LIST_RESPONSE { list };
-
-                self.send_to(identity, &response)?;
-            }
-
-            Msg::PUT_LIST { list } => {
-                println!(
-                    "[{}] Received PUT_LIST for {} from {}",
                     self.uuid, list.id, identity
                 );
-                let mut storage = self.storage.lock().unwrap();
-                storage.write_shopping_list(&list)?;
-                println!("[{}] Stored shopping list {}", self.uuid, list.id);
+
+                let stored = {
+                    let storage = self.storage.lock().expect("poisoned");
+                    storage.get_shopping_list(&list.id)?
+                };
+
+                match stored {
+                    None => {
+                        eprintln!("[{}] Error reading list {}: list not stored", self.uuid, list.id);
+                    },
+                    Some(mut l) => {
+                        match self.send_read_replicate(&list, self.get_replicas(&l.id)).await {
+                            Ok(s) => {
+                                l.list.merge(&s.list);
+
+                                {
+                                    let mut storage = self.storage.lock().expect("poisoned");
+                                    storage.write_shopping_list(&l)?;
+                                }
+
+                                // TODO send ACK to proxy
+                                
+                                println!("[{}] Read shopping list {}", self.uuid, list.id);
+
+                            },
+                            Err(e) =>  {
+                                // TODO send NACK to proxy
+                                eprintln!("[{}] Error reading list {}: {}", self.uuid, list.id, e);
+                            }
+                        }
+                    }
+                }                
             }
 
-            Msg::MERGE_LIST { list } => {
+            Msg::PutList { list } => {
+                // proxy -> coordinator
+                println!(
+                    "[{}] Received PUT for {} from {}",
+                    self.uuid, list.id, identity
+                );
+
+                // TODO: send Ack/Nack to proxy
+                match self.send_write_replicate(&list, self.get_replicas(&list.id)).await {
+                    Ok(_) => {
+                        // only store if we get replicas to store
+                        let mut storage = self.storage.lock().expect("poisoned");
+                        storage.write_shopping_list(&list)?;
+                        
+                        println!("[{}] Stored shopping list {}", self.uuid, list.id);
+
+                    },
+                    Err(e) =>  {
+                        eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e);
+                    }
+                }
+                
+            }
+
+            Msg::ReplicateList { id, list, write } => {
+                if write {
+                    // WRITE
+                    let storing = {
+                        let mut storage = self.storage.lock().expect("poisoned");
+                        storage.write_shopping_list(&list)
+                    };
+
+                    let msg = Msg::Ack { request_id: id };
+
+                    match storing {
+                        Ok(()) => {
+                            self.send_to(identity, &msg);
+                        },
+                        Err(e) => {
+                            eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e)
+                            // do nothing -> if coordinator doesnt receive enough ACKs in X ms it fails
+                        }
+                    }
+                } else {
+                    // READ 
+                    let stored = {
+                        let mut storage = self.storage.lock().expect("poisoned");   
+                        storage.get_shopping_list(&list.id)
+                    };
+
+                    match stored {
+                        Ok(Some(l)) => {
+                            let msg = Msg::AckList { request_id: id, list: l };
+                            self.send_to(identity, &msg);
+                        }
+                        Ok(None) => {
+                            eprintln!("[{}] Error reading list {}: list not stored", self.uuid, list.id)
+                        }
+                        Err(e) => {
+                            eprintln!("[{}] Error reading list {}: {}", self.uuid, list.id, e)
+                            // do nothing -> if coordinator doesnt receive enough ACKs in X ms it fails
+                        }
+                    }
+                }
+            }
+
+            Msg::Ack {request_id} => {
+                let mut g = self.in_flight.lock().expect("poisoned");
+                let quorom_state = g.get_mut(&request_id);
+
+                match quorom_state {
+                    Some(q) => {
+                        q.increment_received();
+
+                        if q.is_quorom_reached() {
+                            if let Some(tx) = q.responder.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                    None => eprintln!("[{}] Error Ack: request with id {} not found", self.uuid, request_id)
+                }
+            }
+
+
+            Msg::Nack { request_id } => {
+                // TODO 
+            }
+
+            Msg::AckList { request_id, list } => {
+                let mut g = self.in_flight.lock().expect("poisoned");
+                let quorom_state = g.get_mut(&request_id);
+
+                match quorom_state {
+                    Some(q) => {
+                        // adds list to state and +1 received
+                        q.add_list(list);
+
+                        if q.is_quorom_reached() {
+                            if let Some(tx) = q.responder.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        
+                    },
+                    None => eprintln!("[{}] Error AckList {}: request with id {} not found", self.uuid, list.id, request_id)
+                }
+            }
+
+            Msg::MergeList { list } => {
                 println!(
                     "[{}] Received MERGE_LIST for {} from {}",
                     self.uuid, list.id, identity
@@ -737,11 +882,12 @@ impl Peer {
                 }
             }
 
-            Msg::LIST_RESPONSE { .. } => {
+            Msg::ListResponse { .. } => {
                 println!("[{}] Received LIST_RESPONSE from {}", self.uuid, identity);
                 // responses are typically handled by the requester?
             }
         }
+
         anyhow::Ok(())
     }
 
@@ -777,6 +923,86 @@ impl Peer {
         ids.iter()
             .filter_map(|id| membership.0.get(id).cloned())
             .collect()
+    }
+
+    async fn send_replicate(&self, shopping_list: &ShoppingList, replicas: Vec<Uuid>, write: bool) -> Result<()> {
+        let request_id = Uuid::new_v4().to_string();
+        let msg = Msg::ReplicateList { id: request_id.clone(), list: shopping_list.clone(), write };
+
+        let (tx, rx) = oneshot::channel();
+
+        let state = QuoromState {
+            needed: if write {WRITE_NODES} else {READ_NODES},
+            received: 0,
+            responder: Some(tx),
+            lists: vec![shopping_list.clone()]
+        };
+
+        {
+            // scope helps -> drops lock auto
+            self.in_flight.lock().expect("poisoned").insert(request_id.clone(), state);
+        }
+
+        for replica in replicas {
+            self.send_to(&replica, &msg);
+        }
+        
+        let result = timeout(Duration::from_millis(REPLICATE_TIMEOUT), rx).await;
+
+        self.in_flight.lock().expect("poisoned").remove(&request_id);
+
+        match result {
+            Ok(Ok(())) => {
+                Ok(())
+            }
+            Ok(Err(_)) => {
+                Err(anyhow::anyhow!("quorum aborted"))
+            }
+            Err(_) => {
+                Err(anyhow::anyhow!("quorum timed out"))
+            }
+
+        }
+    }
+
+    async fn send_write_replicate(&self, shopping_list: &ShoppingList, replicas: Vec<Uuid>) -> Result<()> {
+        self.send_replicate(shopping_list, replicas, true).await
+    }
+
+    async fn send_read_replicate(&self, shopping_list: &ShoppingList, replicas: Vec<Uuid>) -> Result<ShoppingList> {
+        let request_id = Uuid::new_v4().to_string();
+        let msg = Msg::ReplicateList { id: request_id.clone(), list: shopping_list.clone(), write: false };
+
+        let (tx, rx) = oneshot::channel();
+
+        let state = QuoromState {
+            needed: READ_NODES,
+            received: 0,
+            responder: Some(tx),
+            lists: vec![shopping_list.clone()],
+        };
+
+        self.in_flight.lock().expect("poisoned").insert(request_id.clone(), state);
+
+        for replica in replicas {
+            self.send_to(&replica, &msg);
+        }
+
+        let result = timeout(Duration::from_millis(REPLICATE_TIMEOUT), rx).await;
+
+        let quorom_state = self.in_flight.lock().expect("poisoned").remove(&request_id);
+
+        match result {
+            Ok(Ok(())) => {
+                if let Some(q) = quorom_state {
+                    q.merge_lists()
+                } else {
+                    Err(anyhow::anyhow!("quorum state missing"))
+                }
+            }
+            Ok(Err(_)) => Err(anyhow::anyhow!("quorum aborted")),
+            Err(_) => Err(anyhow::anyhow!("quorum timed out")),
+        }
     }
 
     // ---- FAILURE DETECTION ----
