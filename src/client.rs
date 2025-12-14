@@ -107,7 +107,14 @@ impl Client {
                 let response: Msg = serde_json::from_slice(&reply)?;
 
                 match response {
-                    Msg::ListResponse { list } => Ok(list),
+                    Msg::AckList { list, .. } => {
+                        println!("Received AckList from server");
+                        Ok(Some(list))
+                    },
+                    Msg::Nack { .. } => {
+                        println!("Received Nack from server");
+                        Ok(None)
+                    },
                     _ => anyhow::bail!("Unexpected response from server"),
                 }
             }
@@ -123,18 +130,32 @@ impl Client {
         let msg = Msg::PutList { list: list.clone() };
         let payload = serde_json::to_vec(&msg)?;
 
-        if let Err(e) = self.socket.send(payload, zmq::DONTWAIT) {
+        if let Err(_e) = self.socket.send(payload, zmq::DONTWAIT) {
             self.reset_socket()?;
-            return Ok(()) // no server connected, local first
+            return Ok(()); // no server connected, local first
         }
 
         match self.socket.recv_msg(0) {
             Ok(reply) => {
-                println!("Server response: {:?}", String::from_utf8_lossy(&reply));
+                let response: Msg = serde_json::from_slice(&reply)?;
+                match response {
+                    Msg::AckList { .. } => {
+                        println!("Server response: AckList");
+                    }
+                    Msg::Nack { .. } => {
+                        println!("Server response: Nack");
+                    }
+                    _ => {
+                        println!(
+                            "Server response: Unexpected message: {:?}",
+                            String::from_utf8_lossy(&reply)
+                        );
+                    }
+                }
             }
             Err(zmq::Error::EAGAIN) => {
                 self.reset_socket()?;
-                return Ok(()) // server unavailable or slow
+                return Ok(()); // server unavailable or slow
             }
             Err(e) => return Err(e.into()),
         }
