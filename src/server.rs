@@ -24,6 +24,8 @@ const JOIN_TIMEOUT: u64 = 1500;
 const FAILURE_DETECTION_INTERVAL: u64 = 1000;
 const REPLICATE_TIMEOUT: u64 = 3000;
 const HINTED_HANDOFF_INTERVAL: u64 = 3000;
+const MAX_RETRIES: u64 = 3;
+const RETRY_INTERVAL: u64 = 500;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<Uuid, String>);
@@ -641,6 +643,51 @@ impl Peer {
         socket.disconnect(seed_addr)?;
 
         anyhow::Ok(())
+    }
+
+    pub fn leave(&self) {
+        let mut hashring = self.hashring.lock().expect("poisoned");
+
+        // remove ourselves from hashring
+        hashring.remove_node(self.uuid);
+
+        let storage = self.storage.lock().expect("poisoned");
+
+        let rows = storage.get_all_rows().expect("db errror/no rows?");
+
+        for (hash, list) in rows {
+            let preference_list = hashring.get_preference_list_hash(hash);
+            let coordinator = preference_list.first();
+
+            if let Some(id) = coordinator {
+                let msg = Msg::PutList { list };
+                let mut attempt = 0;
+
+                // NOTE se tivessemos tempo hinted handoff aqui era o melhor :(
+                // in case node fails -> retry 
+                loop {
+                    match self.send_to(&id, &msg) {
+                        Ok(_) => break, // success
+                        Err(e) if attempt + 1 < MAX_RETRIES => {
+                            attempt += 1;
+
+                            eprintln!(
+                                "[{}] Failed to send old data (attempt {}/{}): {} — retrying...",
+                                self.uuid, attempt, MAX_RETRIES, e
+                            );
+                            thread::sleep(Duration::from_millis(RETRY_INTERVAL));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[{}] Failed to send old data {} after {} attempts: {}",
+                                self.uuid, id, MAX_RETRIES, e
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // ---- HANDLE MESSAGES ----

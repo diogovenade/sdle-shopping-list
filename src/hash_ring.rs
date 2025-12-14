@@ -64,6 +64,31 @@ impl HashRing {
         preference_list
     }
 
+    pub fn get_preference_list_hash(&self, hash: u128) -> Vec<Uuid> {
+        if self.ring.is_empty() {
+            return vec![];
+        }
+
+        let mut preference_list = Vec::new();
+        let mut seen_servers = HashSet::new();
+
+        let iter = self.ring.range(hash..).chain(self.ring.iter());
+
+        for (_, node_id) in iter {
+            // Only add distinct physical nodes
+            if !seen_servers.contains(node_id) {
+                preference_list.push(*node_id);
+                seen_servers.insert(*node_id);
+
+                if preference_list.len() >= self.replicas {
+                    break;
+                }
+            }
+        }
+
+        preference_list
+    }
+
     pub fn get_coordinator(&self, list_id: &Uuid) -> Option<Uuid> {
         self.get_preference_list(list_id).first().copied()
     }

@@ -740,6 +740,30 @@ impl ServerStorage {
         Ok(rows)
     }
 
+    pub fn get_all_rows(&self) -> Result<Vec<(u128, ShoppingList)>> {
+        let mut stmt = self
+            .db_conn
+            .prepare("SELECT (id, crdt_data) FROM shopping_lists")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                // id is stored as BLOB, read as Vec<u8> and convert to u128
+                let id_blob: Vec<u8> = row.get(0)?;
+                let mut id_bytes = [0u8; 16];
+                id_bytes.copy_from_slice(&id_blob);
+                let id_hash = u128::from_be_bytes(id_bytes);
+
+                let crdt_data: Vec<u8> = row.get(1)?;
+                let shopping_list: ShoppingList =
+                    serde_json::from_slice(&crdt_data).expect("json parsing error");
+
+                Ok((id_hash, shopping_list))
+            })?
+            .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+        Ok(rows)
+    }
+
     pub fn delete_shopping_list(&mut self, shopping_list_id: &Uuid) -> Result<()> {
         let tx = self.db_conn.transaction()?;
         let hash = HashRing::hash(&shopping_list_id.to_string()).to_be_bytes();
