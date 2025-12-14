@@ -712,15 +712,23 @@ impl ServerStorage {
     // a server may even need to take in data whose hash is bigger than its own,
     // if no other server is in between. ownership of data is circular and there is wraparound
     // to be taken into consideration.
-    pub fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
-        let mut stmt = self.db_conn.prepare(
-            "SELECT crdt_data FROM shopping_lists WHERE id < (?1) AND hinted_handoff IS NULL",
-        )?;
+    // NOTE: solved probably
+    pub fn get_old_data(&self, node_id: &Uuid, prev_node_hash: u128) -> Result<Vec<ShoppingList>> {
+        let hash = HashRing::hash(&node_id.to_string());
 
-        let hash = HashRing::hash(&node_id.to_string()).to_be_bytes();
+        let query = if prev_node_hash < hash {
+            "SELECT crdt_data FROM shopping_lists WHERE id > ?1 AND id <= ?2 AND hinted_handoff IS NULL"
+        } else {
+            // wraparound case
+            "SELECT crdt_data FROM shopping_lists WHERE (id > ?1 OR id <= ?2) AND hinted_handoff IS NULL"
+        };
+
+        let mut stmt = self.db_conn.prepare(query)?;
+
+        let hash_bytes = hash.to_be_bytes();
 
         let rows = stmt
-            .query_map(params![hash.as_slice()], |row| {
+            .query_map(params![hash_bytes.as_slice()], |row| {
                 let data: Vec<u8> = row.get(0)?;
 
                 let shopping_list: ShoppingList = serde_json::from_slice(&data).unwrap();

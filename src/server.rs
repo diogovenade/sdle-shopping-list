@@ -724,16 +724,67 @@ impl Peer {
         match msg {
             Msg::Gossip { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
+
+                // update hashring
+                let incoming_peers: Vec<Uuid> = table.0.keys().cloned().collect();
+                // let incoming_set: HashSet<Uuid> = incoming_peers.iter().copied().collect();
+                self.add_nodes(incoming_peers);
+
                 // update our table if it changed
                 let mut membership_guard = self.membership.lock().unwrap();
 
-                for (u, addr) in table.0 {
-                    membership_guard.insert(u, addr);
-                }
+                // get new peers
+                let new_entries: Vec<(Uuid, String)> = table
+                    .0
+                    .into_iter()
+                    .filter(|(u, _addr)| !membership_guard.0.contains_key(u))
+                    .collect();
 
-                // update hashring
-                let peer_uuids = membership_guard.0.keys().cloned().collect();
-                self.add_nodes(peer_uuids);
+                // get removed peers (Uuid's only)
+                // let current_peers: HashSet<Uuid> = membership_guard.0.keys().cloned().collect();
+                // let removed_peers: Vec<Uuid> =
+                //     current_peers.difference(&incoming_set).cloned().collect();
+
+                // get predecessors
+                let predecessors = {
+                    self.hashring
+                        .lock()
+                        .expect("poisoned")
+                        .get_predecessors(&self.uuid)
+                };
+
+                for (u, addr) in &new_entries {
+                    // add new entries
+                    membership_guard.insert(*u, addr.clone());
+
+                    // if new node is predecessor
+                    if predecessors.contains(u) {
+                        let prev_hash = {
+                            self.hashring
+                                .lock()
+                                .expect("poisoned")
+                                .prev_node_hash(&self.uuid)
+                        };
+
+                        if let Some(h) = prev_hash {
+                            let old_lists = self
+                                .storage
+                                .lock()
+                                .expect("poisoned/locked")
+                                .get_old_data(&self.uuid, h)?;
+
+                            for l in old_lists {
+                                let msg = Msg::ReplicateList {
+                                    id: "".to_string(),
+                                    list: l,
+                                    write: true,
+                                };
+
+                                let _ = self.send_to(u, &msg);
+                            }
+                        }
+                    }
+                }
             }
 
             Msg::Hello { uuid, addr } => {
