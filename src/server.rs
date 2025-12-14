@@ -396,7 +396,10 @@ impl Peer {
                                 let sender_uuid_str = match identity_msg.as_str() {
                                     Some(id) => id,
                                     None => {
-                                        eprintln!("Peer identity frame invalid: {:?}", identity_msg);
+                                        eprintln!(
+                                            "Peer identity frame invalid: {:?}",
+                                            identity_msg
+                                        );
                                         return;
                                     }
                                 };
@@ -507,7 +510,10 @@ impl Peer {
                                 if let Err(e) =
                                     peer_clone.handle_incoming_proxy(&client_id, msg).await
                                 {
-                                    eprintln!("Error handling message from {:?}: {:?}", client_id, e);
+                                    eprintln!(
+                                        "Error handling message from {:?}: {:?}",
+                                        client_id, e
+                                    );
                                 }
                             });
                         }
@@ -651,10 +657,13 @@ impl Peer {
 
                 match stored {
                     None => {
+                        // if not stored write it
                         eprintln!(
-                            "[{}] Error reading list {}: list not stored",
+                            "[{}] Error reading list {}: list not stored, storing it...",
                             self.uuid, list.id
                         );
+
+                        let _ = self.handle_incoming_put(&client_id, &list).await;
                     }
                     Some(mut l) => {
                         match self
@@ -694,33 +703,7 @@ impl Peer {
                 // proxy -> coordinator
                 println!("[{}] Received PUT for {}", self.uuid, list.id);
 
-                match self
-                    .send_write_replicate(&list, self.get_replicas(&list.id))
-                    .await
-                {
-                    Ok(_) => {
-                        // only store if we get replicas to store
-                        let mut storage = self.storage.lock().expect("poisoned");
-                        storage.write_shopping_list(&list)?;
-
-                        let ack = Msg::Ack {
-                            request_id: "".to_string(),
-                        };
-
-                        self.send_to_proxy(&client_id, &ack);
-
-                        println!("[{}] Stored shopping list {}", self.uuid, list.id);
-                    }
-                    Err(e) => {
-                        let nack = Msg::Nack {
-                            request_id: "".to_string(),
-                        };
-
-                        self.send_to_proxy(&client_id, &nack);
-
-                        eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e);
-                    }
-                }
+                let _ = self.handle_incoming_put(&client_id, &list).await;
             }
 
             _ => {
@@ -920,6 +903,38 @@ impl Peer {
                     self.uuid,
                     msg.name()
                 );
+            }
+        }
+
+        anyhow::Ok(())
+    }
+
+    async fn handle_incoming_put(&self, client_id: &[u8], list: &ShoppingList) -> Result<()> {
+        match self
+            .send_write_replicate(&list, self.get_replicas(&list.id))
+            .await
+        {
+            Ok(_) => {
+                // only store if we get replicas to store
+                let mut storage = self.storage.lock().expect("poisoned");
+                storage.write_shopping_list(&list)?;
+
+                let ack = Msg::Ack {
+                    request_id: "".to_string(),
+                };
+
+                let _ = self.send_to_proxy(&client_id, &ack);
+
+                println!("[{}] Stored shopping list {}", self.uuid, list.id);
+            }
+            Err(e) => {
+                let nack = Msg::Nack {
+                    request_id: "".to_string(),
+                };
+
+                let _ = self.send_to_proxy(&client_id, &nack);
+
+                eprintln!("[{}] Error storing list {}: {}", self.uuid, list.id, e);
             }
         }
 
