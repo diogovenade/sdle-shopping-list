@@ -547,7 +547,11 @@ impl ServerStorage {
 
         Self::initialize_schema(&db_conn)?;
 
-        Ok(Self { server_id, db_path, db_conn })
+        Ok(Self {
+            server_id,
+            db_path,
+            db_conn,
+        })
     }
 
     fn compute_db_path(uuid: &str) -> std::io::Result<PathBuf> {
@@ -577,17 +581,17 @@ impl ServerStorage {
 
         Ok(())
     }
-    
-    // NOTE: to be removed.
+
     pub fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
+        let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
 
         let tx = self.db_conn.transaction()?;
 
         tx.execute(
             "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
          VALUES (?1, ?2, ?3)",
-            params![shopping_list.id.to_string(), data, None::<String>],
+            params![hash.as_slice(), data, None::<String>],
         )?;
 
         tx.commit()?;
@@ -598,7 +602,7 @@ impl ServerStorage {
     pub fn write_shopping_list_handoff(
         &mut self,
         shopping_list: &ShoppingList,
-        server_id: &str, //TODO: better off as Uuid
+        server_id: &Uuid,
     ) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
         let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
@@ -608,7 +612,7 @@ impl ServerStorage {
         tx.execute(
             "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
          VALUES (?1, ?2, ?3)",
-            params![hash.as_slice(), data, server_id],
+            params![hash.as_slice(), data, server_id.to_string()],
         )?;
 
         tx.commit()?;
@@ -649,32 +653,32 @@ impl ServerStorage {
             .query_map([], |row| {
                 let data: Vec<u8> = row.get(0)?;
                 let uuid_raw: String = row.get(1)?;
-                let shopping_list = 
-                    serde_json::from_slice(&data)
-                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                            data.len(),
-                            rusqlite::types::Type::Blob,
-                            Box::new(e),
-                    ))?;
-                let uuid = 
-                    Uuid::parse_str(&uuid_raw)
-                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
-                                uuid_raw.len(),
-                                rusqlite::types::Type::Text,
-                                Box::new(e),
-                        ))?;
+                let shopping_list = serde_json::from_slice(&data).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        data.len(),
+                        rusqlite::types::Type::Blob,
+                        Box::new(e),
+                    )
+                })?;
+                let uuid = Uuid::parse_str(&uuid_raw).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        uuid_raw.len(),
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
                 Ok((uuid, shopping_list))
             })
-        .context("failed to execute hinted handoff query")?
-        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
-        .context("failed to map hinted handoff rows")?;
+            .context("failed to execute hinted handoff query")?
+            .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+            .context("failed to map hinted handoff rows")?;
 
         Ok(rows)
     }
 
     // acho que isto funciona para quando node entra no hash ring
     // isma: this is a start, but does not cover all cases.
-    // a server may even need to take in data whose hash is bigger than its own, 
+    // a server may even need to take in data whose hash is bigger than its own,
     // if no other server is in between. ownership of data is circular and there is wraparound
     // to be taken into consideration.
     pub fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
