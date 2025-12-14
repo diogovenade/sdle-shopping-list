@@ -10,6 +10,7 @@ use std::{
     time::Duration,
     thread
 };
+use zmq::Context;
 
 fn print_usage() {
     eprintln!("Usage: cargo run <client|server|proxy|client-test>");
@@ -21,8 +22,11 @@ async fn main() -> Result<()> {
 
     let Some(run_opt) = args.get(1) else {
         print_usage();
+        drop(args);
         std::process::exit(1);
     };
+
+    let mut ctx = Context::new(); //NOTE: only one context should be created.
 
     match run_opt.as_str() {
         "client" => {
@@ -36,9 +40,9 @@ async fn main() -> Result<()> {
             let seed_addr = "tcp://127.0.0.1:6000";
             let proxy_backend = "tcp://127.0.0.1:5556";
 
-            let p1 = Peer::new(Uuid::new_v4(), &seed_addr, &proxy_backend)?;
-            let p2 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6001", &proxy_backend)?;
-            let p3 = Peer::new(Uuid::new_v4(), "tcp://127.0.0.1:6002", &proxy_backend)?;
+            let p1 = Peer::new(&ctx, Uuid::new_v4(), &seed_addr, &proxy_backend)?;
+            let p2 = Peer::new(&ctx, Uuid::new_v4(), "tcp://127.0.0.1:6001", &proxy_backend)?;
+            let p3 = Peer::new(&ctx, Uuid::new_v4(), "tcp://127.0.0.1:6002", &proxy_backend)?;
 
             let sp1: SharedPeer = Arc::new(p1);
             let sp2: SharedPeer = Arc::new(p2);
@@ -77,6 +81,8 @@ async fn main() -> Result<()> {
         }
         _ => {
             print_usage();
+            drop(args);
+            ctx.destroy().expect("Failed to destroy zmq context.");
             std::process::exit(1);
         }
     }

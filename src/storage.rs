@@ -1,6 +1,6 @@
 use crate::crdt::{AWORMap, GCounter, Item, LWWReg, Mergeable, PNCounter, ShoppingList};
 use crate::hash_ring::HashRing;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use rusqlite::{Connection, Result as sqlResult, Row, ToSql, params};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -531,21 +531,23 @@ impl ClientStorage {
 }
 
 pub struct ServerStorage {
-    path: PathBuf,
-    conn: Connection,
+    pub server_id: Uuid,
+    db_path: PathBuf,
+    db_conn: Connection,
 }
 
 impl ServerStorage {
-    pub fn new(uuid: &str) -> Result<Self> {
-        let path = Self::compute_db_path(uuid)?;
-        let conn = Connection::open(&path)?;
+    pub fn new(server_id: Uuid) -> Result<Self> {
+        let id_str = server_id.to_string();
+        let db_path = Self::compute_db_path(id_str.as_str())?;
+        let db_conn = Connection::open(&db_path)?;
 
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        conn.execute_batch("PRAGMA journal_mode = WAL;")?;
+        db_conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        db_conn.execute_batch("PRAGMA journal_mode = WAL;")?;
 
-        Self::initialize_schema(&conn)?;
+        Self::initialize_schema(&db_conn)?;
 
-        Ok(Self { path, conn })
+        Ok(Self { server_id, db_path, db_conn })
     }
 
     fn compute_db_path(uuid: &str) -> std::io::Result<PathBuf> {
@@ -575,11 +577,12 @@ impl ServerStorage {
 
         Ok(())
     }
-
+    
+    // NOTE: to be removed.
     pub fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
 
-        let tx = self.conn.transaction()?;
+        let tx = self.db_conn.transaction()?;
 
         tx.execute(
             "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
@@ -595,17 +598,17 @@ impl ServerStorage {
     pub fn write_shopping_list_handoff(
         &mut self,
         shopping_list: &ShoppingList,
-        uuid: &str,
+        server_id: &str, //TODO: better off as Uuid
     ) -> Result<()> {
         let data: Vec<u8> = serde_json::to_vec(shopping_list)?;
         let hash = HashRing::hash(&shopping_list.id.to_string()).to_be_bytes();
 
-        let tx = self.conn.transaction()?;
+        let tx = self.db_conn.transaction()?;
 
         tx.execute(
             "INSERT OR REPLACE INTO shopping_lists (id, crdt_data, hinted_handoff)
          VALUES (?1, ?2, ?3)",
-            params![hash.as_slice(), data, uuid],
+            params![hash.as_slice(), data, server_id],
         )?;
 
         tx.commit()?;
@@ -617,7 +620,7 @@ impl ServerStorage {
         let hash = HashRing::hash(&shopping_list_id.to_string()).to_be_bytes();
 
         let mut stmt = self
-            .conn
+            .db_conn
             .prepare("SELECT crdt_data FROM shopping_lists WHERE id = ?1")?;
 
         let mut rows = stmt.query(params![hash.as_slice()])?;
@@ -634,29 +637,48 @@ impl ServerStorage {
 
     // return dest + shopping list
     pub fn get_hinted_handoffs(&self) -> Result<Vec<(Uuid, ShoppingList)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT crdt_data, hinted_handoff FROM shopping_lists WHERE hinted_handoff IS NOT NULL",
-        )?;
+        let mut stmt = self
+            .db_conn
+            .prepare(
+                "SELECT crdt_data, hinted_handoff FROM shopping_lists \
+                WHERE hinted_handoff IS NOT NULL",
+            )
+            .context("failed to prepare hinted handoff query")?;
 
         let rows = stmt
             .query_map([], |row| {
                 let data: Vec<u8> = row.get(0)?;
                 let uuid_raw: String = row.get(1)?;
-
-                // TODO: nao usar unwraps, nao percebo pq nao consigo usar '?'
-                let shopping_list: ShoppingList = serde_json::from_slice(&data).unwrap();
-                let uuid = Uuid::parse_str(&uuid_raw).unwrap();
-
+                let shopping_list = 
+                    serde_json::from_slice(&data)
+                    .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                            data.len(),
+                            rusqlite::types::Type::Blob,
+                            Box::new(e),
+                    ))?;
+                let uuid = 
+                    Uuid::parse_str(&uuid_raw)
+                        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(
+                                uuid_raw.len(),
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                        ))?;
                 Ok((uuid, shopping_list))
-            })?
-            .collect::<Result<Vec<(Uuid, ShoppingList)>, _>>()?;
+            })
+        .context("failed to execute hinted handoff query")?
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .context("failed to map hinted handoff rows")?;
 
         Ok(rows)
     }
 
     // acho que isto funciona para quando node entra no hash ring
+    // isma: this is a start, but does not cover all cases.
+    // a server may even need to take in data whose hash is bigger than its own, 
+    // if no other server is in between. ownership of data is circular and there is wraparound
+    // to be taken into consideration.
     pub fn get_old_data(&self, node_id: &Uuid) -> Result<Vec<ShoppingList>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.db_conn.prepare(
             "SELECT crdt_data FROM shopping_lists WHERE id < (?1) AND hinted_handoff IS NULL",
         )?;
 

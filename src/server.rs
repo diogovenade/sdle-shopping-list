@@ -17,7 +17,7 @@ use crate::hash_ring::{HashRing, REPLICAS, VNODES};
 use crate::message::Msg;
 use crate::storage::ServerStorage;
 
-const GOSSIP_INTERVAL: u64 = 500;
+const GOSSIP_INTERVAL: u64 = 500; // ms
 const JOIN_TIMEOUT: u64 = 1500;
 const FAILURE_TIMEOUT: u64 = 1000;
 
@@ -26,9 +26,17 @@ const FAILURE_TIMEOUT: u64 = 1000;
 pub struct MembershipTable(pub HashMap<Uuid, String>);
 
 impl MembershipTable {
-    pub fn insert(&mut self, uuid: Uuid, addr: String) {
-        self.0.insert(uuid, addr);
+    pub fn insert(&mut self, server_id: Uuid, addr: String) {
+        self.0.insert(server_id, addr);
     }
+}
+
+// for maintaining long-lived connections.
+
+pub struct DealerMap(pub Mutex<HashMap<Uuid, Arc<Mutex<Socket>>>>);
+
+impl DealerMap {
+    //TODO
 }
 
 #[derive(Debug, Clone)]
@@ -45,21 +53,26 @@ impl FailureTable {
         Self(HashMap::new())
     }
 
-    pub fn mark_failure(&mut self, uuid: Uuid) {
-        let entry = self.0.entry(uuid).or_insert(PeerFailureInfo {
-            last_failure: Instant::now(),
-            consecutive_failures: 0,
-        });
-        entry.last_failure = Instant::now();
-        entry.consecutive_failures += 1;
+    pub fn mark_failure(&mut self, server_id: Uuid) {
+        let now = Instant::now();
+
+        self.0.entry(server_id).and_modify(|e| {
+            e.last_failure = now;
+            e.consecutive_failures +=1;
+        }).or_insert(
+            PeerFailureInfo {
+                last_failure: now,
+                consecutive_failures: 1
+            }
+        );
     }
 
-    pub fn clear_failure(&mut self, uuid: &Uuid) {
-        self.0.remove(uuid);
+    pub fn clear_failure(&mut self, server_id: &Uuid) {
+        self.0.remove(server_id);
     }
 
-    pub fn is_available(&self, uuid: &Uuid) -> bool {
-        match self.0.get(uuid) {
+    pub fn is_available(&self, server_id: &Uuid) -> bool {
+        match self.0.get(server_id) {
             None => true, 
             Some(info) => {
                 // consider unavailable if more than 3 consecutive failures, OR failed within last FAILURE_TIMEOUT ms
@@ -74,14 +87,14 @@ impl FailureTable {
 
 
 pub struct Peer {
-    pub uuid: Uuid,
-    storage: Mutex<ServerStorage>,
+    pub uuid: Uuid, // NOTE: apparently the server id is the dealer id of the one connected to the proxy
+    storage: Mutex<ServerStorage>, 
 
     // network related
     addr: String,
     ctx: Context,
     router: Mutex<Socket>,              // for incoming messages
-    dealer: Mutex<Socket>,
+    proxy_dealer: Mutex<Socket>,
     membership: Mutex<MembershipTable>, // stores known addresses
     hashring: Mutex<HashRing>,          // stores hashring
     failure: Mutex<FailureTable>        // stores nodes which are failing
@@ -90,8 +103,8 @@ pub struct Peer {
 pub type SharedPeer = Arc<Peer>;
 
 impl Peer {
-    pub fn new(uuid: Uuid, bind_addr: &str, proxy_addr: &str) -> Result<Self> {
-        let ctx = Context::new();
+    pub fn new(context: &Context, uuid: Uuid, bind_addr: &str, proxy_addr: &str) -> Result<Self> {
+        let ctx = context.clone();
 
         let router = ctx.socket(SocketType::ROUTER)?;
         // router.set_identity(uuid.as_bytes())?; // ROUTER socket identity -> not important, router is the one who needs to know the requests identity
@@ -104,20 +117,21 @@ impl Peer {
 
         // this table will be changed if joining an active cluster
         let mut membership = MembershipTable(HashMap::new());
-        membership.insert(uuid.clone(), bind_addr.to_string());
+        membership.insert(uuid, bind_addr.to_string());
 
-        let storage = ServerStorage::new(&uuid.to_string())?;
+        let storage = ServerStorage::new(uuid)?;
 
         let mut hashring = HashRing::new(VNODES, REPLICAS);
-        hashring.add_node(uuid.clone());
+        hashring.add_node(uuid);
 
         let failure = FailureTable::new();
+
 
         anyhow::Ok(Self {
             ctx,
             uuid,
             router: Mutex::new(router),
-            dealer: Mutex::new(dealer),
+            proxy_dealer: Mutex::new(dealer),
             membership: Mutex::new(membership),
             addr: bind_addr.to_string(),
             storage: Mutex::new(storage),
@@ -168,6 +182,10 @@ impl Peer {
     }
 
     // wrapper to send messages, open/closes conn and serializes Msg to JSON
+    // NOTE: it is a TERRIBLE design to open ephemeral sockets and connections
+    // whenever we want to send a message. sockets and connections NEED to be long lived
+    // and reused. also, we CANNOT reuse the identity of the server (dealer connected to 
+    // proxy) for each of its dealers connected to other peers!!
     fn send_to(&self, uuid: &Uuid, msg: &Msg) -> Result<()> {
         // open socket
         let socket = match self.connect_to_peer(uuid) {
@@ -203,7 +221,7 @@ impl Peer {
         // close socket
         self.close_conn(uuid, socket)?;
 
-        anyhow::Ok(())
+        Ok(())
     }
 
     fn send_gossip(&self) -> Result<()> {
@@ -361,7 +379,7 @@ impl Peer {
 
     async fn listen_proxy(peer: SharedPeer) {
         tokio::task::spawn_blocking(move || {
-            let dealer = &peer.dealer;
+            let dealer = &peer.proxy_dealer;
             loop {
                 let dealer_guard = dealer.lock().unwrap();
                 let mut items = [dealer_guard.as_poll_item(zmq::POLLIN)];
@@ -579,7 +597,7 @@ impl Peer {
                 let response = Msg::LIST_RESPONSE { list };
                 let reply = serde_json::to_vec(&response)?;
 
-                let dealer_guard = self.dealer.lock().unwrap();
+                let dealer_guard = self.proxy_dealer.lock().unwrap();
                 let out_frames = vec![client_id, Vec::new(), reply];
                 dealer_guard.send_multipart(out_frames, 0)?;
             }
@@ -593,14 +611,14 @@ impl Peer {
                 storage.write_shopping_list(&list)?;
                 
                 let response = format!("Stored shopping list {}", list.id).into_bytes();
-                let dealer_guard = self.dealer.lock().unwrap();
+                let dealer_guard = self.proxy_dealer.lock().unwrap();
                 let out_frames = vec![client_id, Vec::new(), response];
                 dealer_guard.send_multipart(out_frames, 0)?;
             }
 
             _ => {
                 let error_reply = format!("Error: Unsupported message type for client requests").into_bytes();
-                let dealer_guard = self.dealer.lock().unwrap();
+                let dealer_guard = self.proxy_dealer.lock().unwrap();
                 let out_frames = vec![client_id, Vec::new(), error_reply];
                 dealer_guard.send_multipart(out_frames, 0)?;
             }
