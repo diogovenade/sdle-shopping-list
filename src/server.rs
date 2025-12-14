@@ -769,6 +769,11 @@ impl Peer {
 
     async fn handle_incoming(&self, identity: &Uuid, msg: Msg) -> Result<()> {
         match msg {
+            Msg::Leave => {
+                println!("[{}] Received LEAVE from {}", self.uuid, identity);
+                self.leave();
+            }
+
             Msg::Gossip { table } => {
                 println!("[{}] Received GOSSIP from {}", self.uuid, identity);
 

@@ -33,7 +33,8 @@ pub enum Msg {
     ReplicateList {id: String, list: ShoppingList, write: bool},
     MergeList { list: ShoppingList },
     ListResponse { list: Option<ShoppingList> },
-    Handoff {request_id: String, list: ShoppingList, original_node: Uuid}
+    Handoff {request_id: String, list: ShoppingList, original_node: Uuid},
+    Leave
 }
 
 impl Msg {
@@ -51,7 +52,7 @@ impl Msg {
             Msg::AckList { .. } => "AckList",
             Msg::Handoff { .. } => "HANDOFF",
             Msg::Ping => "PING",
-
+            Msg::Leave => "LEAVE",
         }
     }
 }
