@@ -49,6 +49,9 @@ impl Msg {
             Msg::ListResponse { .. } => "LIST_RESPONSE",
             Msg::ReplicateList {..} => "REPLICATE",
             Msg::AckList { .. } => "AckList",
+            Msg::Handoff { .. } => "HANDOFF",
+            Msg::Ping => "PING",
+
         }
     }
 }

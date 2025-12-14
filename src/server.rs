@@ -21,8 +21,9 @@ use crate::storage::ServerStorage;
 
 const GOSSIP_INTERVAL: u64 = 500; // ms
 const JOIN_TIMEOUT: u64 = 1500;
-const FAILURE_TIMEOUT: u64 = 1000;
+const FAILURE_DETECTION_INTERVAL: u64 = 1000;
 const REPLICATE_TIMEOUT: u64 = 3000;
+const HINTED_HANDOFF_INTERVAL: u64 = 3000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MembershipTable(pub HashMap<Uuid, String>);
@@ -926,7 +927,40 @@ impl Peer {
 
     // ---- HINTED-HANDOFF ----
 
-    
+    async fn hinted_handoff(peer: SharedPeer) {
+        let interval = Duration::from_millis(HINTED_HANDOFF_INTERVAL);
+
+        loop {
+            sleep(interval).await;
+
+            let peer_clone = Arc::clone(&peer);
+
+            let result = tokio::task::spawn_blocking(move || {
+                let handoffs = peer_clone
+                    .storage
+                    .lock()
+                    .expect("poisoned")
+                    .get_hinted_handoffs()?;
+
+                for (dest, list) in handoffs {
+                    let msg = Msg::ReplicateList {
+                        id: Uuid::new_v4().to_string(), // no need for quorom so random uuid is ok
+                        list,
+                        write: true,
+                    };
+
+                    let _ = peer_clone.send_to(&dest, &msg);
+                }
+
+                anyhow::Ok(())
+            })
+            .await;
+
+            if let Err(e) = result {
+                eprintln!("Hinted handoff blocking task failed: {:?}", e);
+            }
+        }
+    }
 
     // ---- UTILITIES ----
 
@@ -1118,7 +1152,7 @@ impl Peer {
     }
 
     async fn failure_detection(peer: SharedPeer) {
-        let interval = Duration::from_millis(FAILURE_TIMEOUT);
+        let interval = Duration::from_millis(FAILURE_DETECTION_INTERVAL);
 
         loop {
             sleep(interval).await;
