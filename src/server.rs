@@ -265,6 +265,7 @@ impl Peer {
     }
 
     fn send_to_proxy(&self, client_id: &[u8], msg: &Msg) -> Result<()> {
+        println!("[{}] Sending {:?} to proxy", self.uuid, msg.name());
         let empty = b"";
         let data = serde_json::to_vec(msg)?;
 
@@ -435,99 +436,40 @@ impl Peer {
     }
 
     async fn listen_proxy(peer: SharedPeer) {
-        tokio::task::spawn_blocking(move || {
-            let dealer = &peer.proxy_dealer;
-            loop {
-                let dealer_guard = dealer.lock().unwrap();
+        let dealer = &peer.proxy_dealer;
+        loop {
+            let dealer_clone = Arc::clone(&peer);
+
+            // Blocking poll & recv
+            let result = tokio::task::spawn_blocking(move || {
+                let dealer_guard = dealer_clone.proxy_dealer.lock().unwrap();
                 let mut items = [dealer_guard.as_poll_item(zmq::POLLIN)];
 
-                match zmq::poll(&mut items, -1) {
-                    Ok(ready_count) if ready_count > 0 => {
-                        if items[0].is_readable() {
-                            // receive client_id frame
-                            let client_id_msg = match dealer_guard.recv_msg(zmq::DONTWAIT) {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[{}] Failed to receive client_id: {:?}",
-                                        peer.uuid, e
-                                    );
-                                    continue;
-                                }
-                            };
+                if zmq::poll(&mut items, -1).is_ok() && items[0].is_readable() {
+                    let client_id_msg = dealer_guard.recv_msg(zmq::DONTWAIT).ok()?;
+                    let _empty_msg = dealer_guard.recv_msg(0).ok()?;
+                    let data_msg = dealer_guard.recv_msg(0).ok()?;
+                    Some((client_id_msg, data_msg))
+                } else {
+                    None
+                }
+            })
+            .await
+            .unwrap(); // unwrap the JoinHandle
 
-                            // receive empty frame
-                            let _ = match dealer_guard.recv_msg(0) {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[{}] Failed to receive empty frame: {:?}",
-                                        peer.uuid, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            // receive data frame
-                            let data_msg = match dealer_guard.recv_msg(0) {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[{}] Failed to receive data frame: {:?}",
-                                        peer.uuid, e
-                                    );
-                                    continue;
-                                }
-                            };
-
-                            let msg: Msg = match serde_json::from_slice(&data_msg) {
-                                Ok(msg) => msg,
-                                Err(e) => {
-                                    eprintln!("Failed to parse message: {:?}", e);
-                                    continue;
-                                }
-                            };
-
-                            let client_id = client_id_msg.to_vec();
-
-                            // spawn new thread for concurrent message handling
-                            let peer_clone = Arc::clone(&peer);
-                            tokio::spawn(async move {
-                                // let client_id = match client_id_msg.to_vec() {
-                                //     Some(id) => id,
-                                //     None => {
-                                //         eprintln!("Proxy identity frame invalid: {:?}", client_id_msg.as_str());
-                                //         return;
-                                //     }
-                                // };
-
-                                // let client_id = match Uuid::from_str(client_id_str) {
-                                //     Ok(s) => s,
-                                //     Err(e) => {
-                                //         eprintln!("error parsing uuid: {e}");
-                                //         return;
-                                //     }
-                                // };
-
-                                if let Err(e) =
-                                    peer_clone.handle_incoming_proxy(&client_id, msg).await
-                                {
-                                    eprintln!(
-                                        "Error handling message from {:?}: {:?}",
-                                        client_id, e
-                                    );
-                                }
-                            });
-                        }
+            // Handle async after blocking task
+            if let Some((client_id_msg, data_msg)) = result {
+                if let Ok(msg) = serde_json::from_slice::<Msg>(&data_msg) {
+                    let client_id = client_id_msg.to_vec();
+                    // This is async, so we can await it
+                    if let Err(e) = peer.handle_incoming_proxy(&client_id, msg).await {
+                        eprintln!("Error handling message from {:?}: {:?}", client_id, e);
                     }
-                    Ok(_) => continue, // no events
-                    Err(e) => {
-                        eprintln!("[{}] proxy poll error: {:?}", peer.uuid, e);
-                        continue;
-                    }
+                } else {
+                    eprintln!("Failed to parse message");
                 }
             }
-        });
+        }
     }
 
     pub async fn start(peer: SharedPeer) {
@@ -645,7 +587,7 @@ impl Peer {
         anyhow::Ok(())
     }
 
-    pub fn leave(&self) -> Result<()>{
+    pub fn leave(&self) -> Result<()> {
         let mut hashring = self.hashring.lock().expect("poisoned");
 
         // remove ourselves from hashring
@@ -664,7 +606,7 @@ impl Peer {
                 let mut attempt = 0;
 
                 // NOTE se tivessemos tempo hinted handoff aqui era o melhor :(
-                // in case node fails -> retry 
+                // in case node fails -> retry
                 loop {
                     match self.send_to(&id, &msg) {
                         Ok(_) => break, // success
@@ -732,7 +674,7 @@ impl Peer {
 
                                 let ack = Msg::AckList {
                                     request_id: "".to_string(),
-                                    list: l
+                                    list: l,
                                 };
 
                                 let _ = self.send_to_proxy(&client_id, &ack);
@@ -1034,7 +976,7 @@ impl Peer {
 
                 let ack = Msg::AckList {
                     request_id: "".to_string(),
-                    list: list.clone()
+                    list: list.clone(),
                 };
 
                 let _ = self.send_to_proxy(&client_id, &ack);
