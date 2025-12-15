@@ -90,11 +90,29 @@ async fn main() -> Result<()> {
             )?;
             port += 1;
 
+            let p4 = Peer::new(
+                &ctx,
+                Uuid::new_v4(),
+                &format!("tcp://127.0.0.1:{}", port),
+                &proxy_backend,
+            )?;
+            port += 1;
+
+            let p5 = Peer::new(
+                &ctx,
+                Uuid::new_v4(),
+                &format!("tcp://127.0.0.1:{}", port),
+                &proxy_backend,
+            )?;
+            port += 1;
+
             let _ = write_port(port);
 
             let sp1: SharedPeer = Arc::new(p1);
             let sp2: SharedPeer = Arc::new(p2);
             let sp3: SharedPeer = Arc::new(p3);
+            let sp4: SharedPeer = Arc::new(p4);
+            let sp5: SharedPeer = Arc::new(p5);
 
             // start seed node first
             Peer::start(Arc::clone(&sp1)).await;
@@ -109,8 +127,18 @@ async fn main() -> Result<()> {
                 eprintln!("{} failed to join: {}", sp3.uuid, e);
             }
 
+            if let Err(e) = sp4.join(&seed_addr) {
+                eprintln!("{} failed to join: {}", sp2.uuid, e);
+            }
+
+            if let Err(e) = sp5.join(&seed_addr) {
+                eprintln!("{} failed to join: {}", sp3.uuid, e);
+            }
+
             Peer::start(Arc::clone(&sp2)).await;
             Peer::start(Arc::clone(&sp3)).await;
+            Peer::start(Arc::clone(&sp4)).await;
+            Peer::start(Arc::clone(&sp5)).await;
 
             loop {
                 thread::sleep(Duration::from_millis(1));
