@@ -2,6 +2,7 @@
 use std::cmp::{self, Ordering};
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::{self, Display};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 pub trait Mergeable<V> {
@@ -9,16 +10,30 @@ pub trait Mergeable<V> {
 }
 
 // ShoppingList
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ShoppingList {
-    id: Uuid,
-    list: AWORMap,
+    pub id: Uuid,
+    pub list: AWORMap,
 }
 
 // Item
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
-    amount: PNCounter,
-    acquired: LWWReg<Uuid>,
+    pub amount: PNCounter,
+    pub acquired: LWWReg<Uuid>, //TODO: weak causality, consider swapping for MVReg
+                                //NOTE: acquired to be treated as bool
+}
+
+impl Item {
+    pub fn new(quantity: u64, acquired: bool, client_id: Uuid) -> Self {
+        let amount = PNCounter::with_count(client_id, quantity);
+        let acquired = LWWReg {
+            val: acquired as u32, 
+            clock: 0u32, 
+            actor: client_id,
+        };
+        Item { amount, acquired }
+    }
 }
 
 impl Mergeable<Item> for Item {
@@ -29,9 +44,9 @@ impl Mergeable<Item> for Item {
 }
 
 // AWORMap
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AWORMap {
-    items: HashMap<String, Item>,
+    pub items: HashMap<String, Item>,
 }
 
 impl AWORMap {
@@ -274,11 +289,11 @@ impl<A: Ord + Copy> PartialOrd for VClock<A> {
 */
 
 // LLWReg
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LWWReg<A> {
-    val: u32,
-    clock: u32, // monotonic value
-    actor: A,   // per actor
+    pub val: u32,
+    pub clock: u32, // monotonic value
+    pub actor: A,   // per actor
 }
 
 impl<A: Ord + Copy> LWWReg<A> {
@@ -324,10 +339,10 @@ impl<A: Ord + Default> Default for LWWReg<A> {
 }
 
 // PNCounter
-#[derive(Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PNCounter {
-    p: GCounter,
-    n: GCounter,
+    pub p: GCounter,
+    pub n: GCounter,
 }
 
 impl PNCounter {
@@ -338,12 +353,27 @@ impl PNCounter {
         }
     }
 
+    pub fn with_count(id: Uuid, amount: u64) -> Self {
+        let p = GCounter::with_count(id, amount);
+        let n = GCounter::with_count(id, 0);
+
+        PNCounter { p, n }
+    }
+
     pub fn inc(&mut self) {
         self.p.inc();
     }
 
+    pub fn inc_by(&mut self, n: u64) {
+        self.p.inc_by(n);
+    }
+
     pub fn dec(&mut self) {
         self.n.inc();
+    }
+
+    pub fn dec_by(&mut self, n: u64) {
+        self.n.inc_by(n);
     }
 
     pub fn value_local(&self) -> i64 {
@@ -363,26 +393,36 @@ impl Mergeable<PNCounter> for PNCounter {
 }
 
 // GCounter
-#[derive(Clone)]
-struct GCounter {
-    counter: HashMap<Uuid, u64>,
-    id: Uuid,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GCounter {
+    pub counter: HashMap<Uuid, u64>,
+    pub actor_id: Uuid,
 }
 
 impl GCounter {
-    pub fn new(id: Uuid) -> Self {
+    pub fn new(actor_id: Uuid) -> Self {
         GCounter {
             counter: HashMap::new(),
-            id,
+            actor_id,
         }
     }
 
+    pub fn with_count(actor_id: Uuid, count: u64) -> Self {
+        let mut counter = HashMap::new();
+        counter.insert(actor_id, count);
+        GCounter { counter, actor_id }
+    }
+
     pub fn inc(&mut self) {
-        *self.counter.entry(self.id).or_insert(0) += 1;
+        *self.counter.entry(self.actor_id).or_insert(0) += 1;
+    }
+
+    pub fn inc_by(&mut self, n: u64) {
+        *self.counter.entry(self.actor_id).or_insert(0) += n;
     }
 
     pub fn value_local(&self) -> u64 {
-        *self.counter.get(&self.id).unwrap_or(&0)
+        *self.counter.get(&self.actor_id).unwrap_or(&0)
     }
 
     pub fn value_total(&self) -> u64 {
@@ -892,7 +932,7 @@ mod tests {
 
         m1.merge(&r2);
         m2.merge(&r1);
-        
+
         let mut k1 = m1.keys();
         let mut k2 = m2.keys();
         k1.sort();

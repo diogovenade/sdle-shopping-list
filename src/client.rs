@@ -1,25 +1,230 @@
+use crate::crdt::{AWORMap, Mergeable, ShoppingList};
+use crate::message::Msg;
+use crate::storage::ClientStorage;
+use anyhow::Result;
+use serde_json;
+use std::collections::HashMap;
 use uuid::Uuid;
-use zmq::{Context, Error, SocketType};
+use zmq::{Context, Error as zmqErr, Socket, SocketType};
 
-struct Client {
-    id: Uuid,
+pub struct ShoppingListInterface {
+    pub list_id: Uuid,
+    pub items: HashMap<String, (u64, bool)>, // <name, (amount, acquired)>
 }
-pub fn client_connect() -> Result<(), Error> {
-    println!("Connecting to server...");
-    let context = Context::new();
-    let requester = context.socket(SocketType::REQ)?;
-    let _ = requester.connect("tcp://localhost:5555");
 
-    for request in 1..11 {
-        println!("Sending hello... {}", request);
-        let message = "Hello Server!";
-        requester.send(message, 0)?;
-        let message = requester.recv_msg(0)?;
-        println!("Received: {}", message.as_str().unwrap_or("Invalid UTF-8"));
+impl ShoppingListInterface {
+    fn from_crdt(sl: &ShoppingList) -> Self {
+        let mut items = HashMap::new();
+        let map = &sl.list;
+        for (k, v) in map.items.iter() {
+            let name = k.clone();
+            let amount = v.amount.value_total() as u64;
+            let acquired: bool = v.acquired.val != 0;
+            items.insert(name, (amount, acquired));
+        }
+        Self {
+            list_id: sl.id,
+            items: items,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ItemInterface {
+    pub name: String,
+    pub amount: u64,
+    pub acquired: bool,
+}
+
+pub struct Client {
+    pub id: Uuid,
+    storage_handler: ClientStorage,
+    context: Context,
+    socket: Socket,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        // Ensure socket close never blocks
+        let _ = self.socket.set_linger(0);
+
+        // Optional but explicit
+        let _ = self.socket.disconnect("tcp://127.0.0.1:5555");
+    }
+}
+
+impl Client {
+    pub fn new(username: String) -> Result<Self> {
+        let storage_handler = ClientStorage::new(username)?;
+        let context = Context::new();
+        let socket = context.socket(SocketType::REQ)?;
+        socket.set_rcvtimeo(100)?;
+        socket.set_linger(0)?;
+        socket.connect("tcp://127.0.0.1:5555")?;
+        Ok(Self {
+            id: storage_handler.client_id,
+            storage_handler,
+            context,
+            socket,
+        })
     }
 
-    // drop(requester); // rust handles this automatically
-    // Context::destroy(&mut context); // this too
+    fn reset_socket(&self) -> Result<()> {
+        self.socket.disconnect("tcp://127.0.0.1:5555")?;
+        self.socket.connect("tcp://127.0.0.1:5555")?;
+        Ok(())
+    }
 
-    Ok(())
+    pub fn retrieve_available_lists(&self) -> Result<Option<Vec<ShoppingListInterface>>> {
+        let lists = self.storage_handler.get_user_lists()?;
+
+        match lists {
+            Some(vec) => {
+                let mut list_interface_vec: Vec<ShoppingListInterface> = Vec::new();
+                for list in vec {
+                    list_interface_vec.push(ShoppingListInterface::from_crdt(&list));
+                }
+                Ok(Some(list_interface_vec))
+            }
+            None => Ok(None),
+        }
+    }
+
+    pub fn fetch_list(&self, list: &ShoppingList) -> Result<Option<ShoppingList>> {
+        let msg = Msg::GetList { list: list.clone() };
+        let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
+
+        if let Err(e) = self.socket.send(payload, zmq::DONTWAIT) {
+            self.reset_socket()?;
+            return Ok(None);
+        }
+
+        let reply_res = self.socket.recv_msg(0);
+        match reply_res {
+            Ok(reply) => {
+                let response: Msg = serde_json::from_slice(&reply)?;
+
+                match response {
+                    Msg::AckList { list: l, .. } => {
+                        println!("Received AckList from server");
+                        let mut merged = list.clone();
+
+                        merged.list.merge(&l.list);
+
+                        Ok(Some(merged))
+                    }
+                    Msg::Nack { .. } => {
+                        println!("Received Nack from server");
+                        Ok(None)
+                    }
+                    _ => anyhow::bail!("Unexpected response from server"),
+                }
+            }
+            Err(zmq::Error::EAGAIN) => {
+                self.reset_socket()?;
+                return Ok(None); // server unavailable or slow
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    fn send_list(&self, list: &ShoppingList) -> Result<()> {
+        let msg = Msg::PutList { list: list.clone() };
+        let payload = serde_json::to_vec(&msg)?;
+
+        if let Err(_e) = self.socket.send(payload, zmq::DONTWAIT) {
+            self.reset_socket()?;
+            return Ok(()); // no server connected, local first
+        }
+
+        match self.socket.recv_msg(0) {
+            Ok(reply) => {
+                let response: Msg = serde_json::from_slice(&reply)?;
+                match response {
+                    Msg::AckList { request_id, list } => {
+                        println!("Server response: AckList");
+                    }
+                    Msg::Nack { .. } => {
+                        println!("Server response: Nack");
+                    }
+                    _ => {
+                        println!(
+                            "Server response: Unexpected message: {:?}",
+                            String::from_utf8_lossy(&reply)
+                        );
+                    }
+                }
+            }
+            Err(zmq::Error::EAGAIN) => {
+                self.reset_socket()?;
+                return Ok(()); // server unavailable or slow
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        Ok(())
+    }
+
+    pub fn retrieve_list(&mut self, list_id: Uuid) -> Result<ShoppingListInterface> {
+        let local_list = self.storage_handler.read_shopping_list(list_id)?;
+        let remote_list = self.fetch_list(&local_list)?;
+
+        let merged_list = if let Some(remote) = remote_list {
+            let mut merged = local_list;
+            merged.list.merge(&remote.list);
+            let _ = self.storage_handler.write_shopping_list(&merged);
+            merged
+        } else {
+            local_list
+        };
+
+        let list_interface = ShoppingListInterface::from_crdt(&merged_list);
+
+        Ok(list_interface)
+    }
+
+    pub fn send_item_storage_request(
+        &mut self,
+        item_name: String,
+        quantity: u64,
+        acquired: bool,
+        shoppinglist_id: Uuid,
+    ) -> Result<()> {
+        self.storage_handler.handle_item_storage_request(
+            item_name,
+            quantity,
+            acquired,
+            shoppinglist_id,
+        )?;
+
+        let updated_list = self.storage_handler.read_shopping_list(shoppinglist_id)?;
+        self.send_list(&updated_list)?;
+        Ok(())
+    }
+
+    pub fn connect(&self) -> Result<(), zmqErr> {
+        println!("Connecting to proxy frontend...");
+        let context = Context::new();
+        let requester = context.socket(SocketType::REQ)?;
+        requester.connect("tcp://127.0.0.1:5555")?;
+
+        let list_id = Uuid::new_v4();
+        let shopping_list = crate::crdt::ShoppingList {
+            id: list_id,
+            list: crate::crdt::AWORMap::new(),
+        };
+
+        // Send a PutList message with the new shopping list
+        let msg = Msg::GetList {
+            list: shopping_list,
+        };
+        let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
+
+        requester.send(payload, 0)?;
+
+        let reply = requester.recv_multipart(0)?;
+        println!("Received reply: {:?}", reply);
+
+        Ok(())
+    }
 }

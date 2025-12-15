@@ -2,6 +2,11 @@ use md5::{Digest, Md5};
 use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
+pub const VNODES: usize = 3;
+pub const REPLICAS: usize = 3;
+pub const WRITE_NODES: usize = 2; // minimum number of nodes that must participate in a write
+pub const READ_NODES: usize = 2; // minimum number of nodes that must participate in a read
+
 pub struct HashRing {
     ring: BTreeMap<u128, Uuid>, // hash -> server_id
     virtual_nodes: usize,       // partitioning
@@ -20,7 +25,7 @@ impl HashRing {
     pub fn add_node(&mut self, node_id: Uuid) {
         for i in 0..self.virtual_nodes {
             let key = format!("{}-{}", node_id, i);
-            let hash = self.hash(&key);
+            let hash = HashRing::hash(&key);
             self.ring.insert(hash, node_id);
         }
     }
@@ -28,7 +33,7 @@ impl HashRing {
     pub fn remove_node(&mut self, node_id: Uuid) {
         for i in 0..self.virtual_nodes {
             let key = format!("{}-{}", node_id, i);
-            let hash = self.hash(&key);
+            let hash = HashRing::hash(&key);
             self.ring.remove(&hash);
         }
     }
@@ -38,7 +43,32 @@ impl HashRing {
             return vec![];
         }
 
-        let hash = self.hash(&list_id.to_string());
+        let hash = HashRing::hash(&list_id.to_string());
+        let mut preference_list = Vec::new();
+        let mut seen_servers = HashSet::new();
+
+        let iter = self.ring.range(hash..).chain(self.ring.iter());
+
+        for (_, node_id) in iter {
+            // Only add distinct physical nodes
+            if !seen_servers.contains(node_id) {
+                preference_list.push(*node_id);
+                seen_servers.insert(*node_id);
+
+                if preference_list.len() >= self.replicas {
+                    break;
+                }
+            }
+        }
+
+        preference_list
+    }
+
+    pub fn get_preference_list_hash(&self, hash: u128) -> Vec<Uuid> {
+        if self.ring.is_empty() {
+            return vec![];
+        }
+
         let mut preference_list = Vec::new();
         let mut seen_servers = HashSet::new();
 
@@ -71,11 +101,104 @@ impl HashRing {
         self.get_all_servers().len()
     }
 
-    fn hash(&self, key: &str) -> u128 {
+    pub fn hash(key: &str) -> u128 {
         let mut hasher = Md5::new();
         hasher.update(key.as_bytes());
         let result = hasher.finalize();
         u128::from_be_bytes(result.into())
+    }
+
+    pub fn next_node(&self, node_id: &Uuid) -> Option<Uuid> {
+        if self.ring.is_empty() {
+            return None;
+        }
+
+        // Collect all virtual node hashes for this physical node
+        let mut vnodes: Vec<u128> = self
+            .ring
+            .iter()
+            .filter_map(|(hash, id)| if id == node_id { Some(*hash) } else { None })
+            .collect();
+
+        if vnodes.is_empty() {
+            return None;
+        }
+
+        vnodes.sort_unstable();
+        let start = vnodes[0];
+
+        let iter = self.ring.range((start + 1)..).chain(self.ring.iter());
+
+        for (_, next_id) in iter {
+            if next_id != node_id {
+                return Some(*next_id);
+            }
+        }
+
+        None
+    }
+
+    pub fn prev_node_hash(&self, node_id: &Uuid) -> Option<u128> {
+        if self.ring.is_empty() {
+            return None;
+        }
+
+        let vnodes: Vec<u128> = self
+            .ring
+            .iter()
+            .filter_map(|(hash, id)| if id == node_id { Some(*hash) } else { None })
+            .collect();
+
+        if vnodes.is_empty() {
+            return None;
+        }
+
+        let node_hash = vnodes[0];
+
+        // largest hash smaller than node_hash
+        let prev_hash = self
+            .ring
+            .range(..node_hash)
+            .next_back()
+            .map(|(h, _)| *h)
+            .or_else(|| self.ring.iter().next_back().map(|(h, _)| *h));
+
+        prev_hash
+    }
+
+    pub fn get_predecessors(&self, node_id: &Uuid) -> Vec<Uuid> {
+        if self.ring.is_empty() {
+            return vec![];
+        }
+
+        // Collect all distinct physical nodes except node_id
+        let mut seen = HashSet::new();
+        let mut predecessors = Vec::new();
+
+        // Iterate the ring in reverse (counter-clockwise)
+        for (_, id) in self.ring.iter().rev() {
+            if id != node_id && !seen.contains(id) {
+                predecessors.push(*id);
+                seen.insert(*id);
+
+                // so precisamos de andar ate dois antes
+                if predecessors.len() >= self.replicas {
+                    break;
+                }
+            }
+        }
+
+        predecessors
+    }
+
+    pub fn print_ring(&self) {
+        let nodes: Vec<String> = self
+            .ring
+            .values()
+            .map(|id| id.to_string()[..8].to_string())
+            .collect();
+
+        println!("HASH-RING: {}", nodes.join(" -> "));
     }
 }
 
