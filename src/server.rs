@@ -488,6 +488,16 @@ impl Peer {
             Peer::listen_proxy(proxy).await;
         });
 
+        let handoff = Arc::clone(&peer);
+        tokio::spawn(async move {
+            Peer::hinted_handoff(handoff).await;
+        });
+
+        let failure = Arc::clone(&peer);
+        tokio::spawn(async move {
+            Peer::failure_detection(failure).await;
+        });
+
         println!("[{}] Started successfully!", peer.uuid);
     }
 
@@ -602,7 +612,7 @@ impl Peer {
             let coordinator = preference_list.first();
 
             if let Some(id) = coordinator {
-                let msg = Msg::PutList { list };
+                let msg = Msg::ReplicateList { id: "".to_string(), list, write: true };
                 let mut attempt = 0;
 
                 // NOTE se tivessemos tempo hinted handoff aqui era o melhor :(
@@ -1020,6 +1030,8 @@ impl Peer {
                         list: list.clone(),
                         write: true,
                     };
+
+                    
 
                     match peer_clone.send_to(&dest, &msg) {
                         Ok(_) => {

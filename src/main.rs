@@ -17,7 +17,7 @@ use uuid::Uuid;
 use zmq::Context;
 
 fn print_usage() {
-    eprintln!("Usage: cargo run <client|server|proxy|client-test|add-peer|remove-peer>");
+    eprintln!("Usage: cargo run <client|server|proxy|add-peer|remove-peer>");
 }
 
 fn write_port(port: u16) -> std::io::Result<()> {
@@ -126,36 +126,35 @@ async fn main() -> Result<()> {
             );
             proxy.start()?;
         }
-        "client-test" => {
-            let client = Client::new(String::from("test"))?;
-            client.connect()?;
-        }
 
         "add-peer" => {
-            let port = read_port()?;
-            let peer = Peer::new(
-                &ctx,
-                Uuid::new_v4(),
-                &format!("tcp://127.0.0.1:{}", port),
-                &proxy_backend,
-            )?;
+            println!("Unfortunately, not implemented (probably due to a deadlock) :(");
+            // let port = read_port()?;
+            // let peer = Peer::new(
+            //     &ctx,
+            //     Uuid::new_v4(),
+            //     &format!("tcp://127.0.0.1:{}", port),
+            //     &proxy_backend,
+            // )?;
 
-            let _ = write_port(port + 1);
+            // let _ = write_port(port + 1);
 
-            let sp: SharedPeer = Arc::new(peer);
+            // let sp: SharedPeer = Arc::new(peer);
 
-            if let Err(e) = sp.join(&seed_addr) {
-                eprintln!("{} failed to join: {}", sp.uuid, e);
-            }
+            // if let Err(e) = sp.join(&seed_addr) {
+            //     eprintln!("{} failed to join: {}", sp.uuid, e);
+            // }
 
-            Peer::start(Arc::clone(&sp)).await;
+            // Peer::start(Arc::clone(&sp)).await;
 
-            loop {
-                thread::sleep(Duration::from_millis(1));
-            }
+            // loop {
+            //     thread::sleep(Duration::from_millis(1));
+            // }
         }
 
         "remove-peer" => {
+            println!("Unfortunately, not fully implemented (but we got close, check peer.leave(), missing proxy leave and some bugfixin) :(");
+
             let port = args.get(2);
 
             if let Some(port) = port {
