@@ -455,7 +455,7 @@ impl Peer {
                 }
             })
             .await
-            .unwrap(); // unwrap the JoinHandle
+            .unwrap();
 
             // Handle async after blocking task
             if let Some((client_id_msg, data_msg)) = result {
