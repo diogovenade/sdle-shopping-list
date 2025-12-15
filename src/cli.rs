@@ -1,10 +1,10 @@
-use crate::client::{Client, ShoppingListInterface, ItemInterface };
+use crate::client::{Client, ItemInterface, ShoppingListInterface};
+use std::collections::HashMap;
 use std::{
     io::{self, Write},
     ops::RangeBounds,
 };
 use uuid::Uuid;
-use std::collections::HashMap;
 
 const CLEAR_SEQUENCE: &'static str = "\x1B[2J\x1B[1;1H";
 const UPPER_ITEM_COUNT_LIMIT: usize = 1000000;
@@ -13,6 +13,7 @@ pub enum InputRule<'a> {
     AcceptStrings(&'a [&'a str]),
     AcceptNumberRange { low: usize, high: usize },
     Custom(Box<dyn Fn(&str) -> bool + 'a>),
+    AcceptAll,
 }
 
 enum State {
@@ -21,6 +22,7 @@ enum State {
     MainMenu,
     Exit,
     ItemEdit(Uuid, ItemInterface),
+    Share,
 }
 
 pub struct ClientInterfaceManager {
@@ -43,7 +45,7 @@ impl ClientInterfaceManager {
                 print!("{}", CLEAR_SEQUENCE);
                 println!("Logged in as client: {}", client_id.to_string());
                 let list_vec = self.print_lists();
-                println!("Commands: q - quit; <nr> - open list number <nr>; a - add new list;");
+                println!("Commands: q - quit; <nr> - open list number <nr>; a - add new list; s - add remote shopping list");
                 print!("> ");
                 io::stdout().flush().unwrap();
 
@@ -51,7 +53,7 @@ impl ClientInterfaceManager {
                 Self::read_validated_input(
                     &mut input,
                     &[
-                        InputRule::AcceptStrings(&["a", "q"]),
+                        InputRule::AcceptStrings(&["a", "q", "s"]),
                         InputRule::AcceptNumberRange {
                             low: 1,
                             high: list_vec.len(),
@@ -68,9 +70,10 @@ impl ClientInterfaceManager {
                 io::stdout().flush().unwrap();
 
                 let mut input = String::new();
-                Self::read_validated_input(&mut input, &[
-                    InputRule::AcceptStrings(&["q", "b", "a"])
-                ]);
+                Self::read_validated_input(
+                    &mut input,
+                    &[InputRule::AcceptStrings(&["q", "b", "a"])],
+                );
                 self.handle_newlist_edit(input, list_id);
             }
             State::ListEdit(list_id) => {
@@ -80,34 +83,76 @@ impl ClientInterfaceManager {
                     print!("{}", CLEAR_SEQUENCE);
                     let items = Self::print_and_process_list_items(list);
 
-                    println!("\nCommands: q - quit; b- back to menu; <nr> - edit item number <nr>; a - add new item;");
+                    println!(
+                        "\nCommands: q - quit; b- back to menu; <nr> - edit item number <nr>; a - add new item;"
+                    );
                     print!("> ");
                     io::stdout().flush().unwrap();
 
-                    Self::read_validated_input(&mut input, &[
-                        InputRule::AcceptStrings(&["q", "b", "a"]),
-                        InputRule::AcceptNumberRange { low: 1, high: items.len() },
-                    ]);
+                    Self::read_validated_input(
+                        &mut input,
+                        &[
+                            InputRule::AcceptStrings(&["q", "b", "a"]),
+                            InputRule::AcceptNumberRange {
+                                low: 1,
+                                high: items.len(),
+                            },
+                        ],
+                    );
                     self.handle_list_edit(input, &items, list_id);
                 } else {
                     println!("Error retrieving list items.");
                     self.screen = State::MainMenu;
                     io::stdout().flush().unwrap();
                     let _ = io::stdin().read_line(&mut input);
-                } 
+                }
             }
             State::ItemEdit(list_id, item) => {
-                println!("Editing item {}. a<nr> - change amount to <nr>; d - toggle acquired status; b - go back, doing nothing;", &item.name);
+                println!(
+                    "Editing item {}. a<nr> - change amount to <nr>; d - toggle acquired status; b - go back, doing nothing;",
+                    &item.name
+                );
                 print!("> ");
                 io::stdout().flush().unwrap();
                 let mut input = String::new();
-                Self::read_validated_input(&mut input, &[
-                    InputRule::AcceptStrings(&["q", "d", "b"]),
-                    InputRule::Custom(Box::new(|s: &str | {
-                        s.starts_with('a') && s.len() > 1 && s[1..].chars().all(|c| c.is_ascii_digit())
-                    }))
-                ]);
+                Self::read_validated_input(
+                    &mut input,
+                    &[
+                        InputRule::AcceptStrings(&["q", "d", "b"]),
+                        InputRule::Custom(Box::new(|s: &str| {
+                            s.starts_with('a')
+                                && s.len() > 1
+                                && s[1..].chars().all(|c| c.is_ascii_digit())
+                        })),
+                    ],
+                );
                 self.handle_item_edit(input, item, list_id);
+            }
+            State::Share => {
+                println!("Please enter the shopping list id");
+                print!("> ");
+
+                io::stdout().flush().unwrap();
+
+                let mut input = String::new();
+                Self::read_validated_input(
+                    &mut input,
+                    &[InputRule::Custom(Box::new(|input: &str| {
+                        Uuid::parse_str(input).is_ok()
+                    }))],
+                );
+
+                let uuid = Uuid::parse_str(&input).unwrap();
+
+                match self.client.send_share(uuid) {
+                    Ok(sl) => self.screen = State::ListEdit(sl.list_id),
+                    Err(e) => {
+                        println!("Error: {}", e);
+                        self.screen = State::MainMenu;
+                        io::stdout().flush().unwrap();
+                        let _ = io::stdin().read_line(&mut input);
+                    }
+                }
             }
             State::Exit => {
                 // byebye
@@ -116,7 +161,7 @@ impl ClientInterfaceManager {
     }
 
     fn handle_item_edit(&mut self, input: String, item: ItemInterface, list_id: Uuid) {
-        match input.as_str(){
+        match input.as_str() {
             "q" => {
                 self.screen = State::Exit;
             }
@@ -126,7 +171,12 @@ impl ClientInterfaceManager {
             "d" => {
                 let acquired = !item.acquired;
 
-                match self.client.send_item_storage_request(item.name, item.amount, acquired, list_id) {
+                match self.client.send_item_storage_request(
+                    item.name,
+                    item.amount,
+                    acquired,
+                    list_id,
+                ) {
                     Ok(_) => {
                         self.screen = State::ListEdit(list_id);
                     }
@@ -148,7 +198,12 @@ impl ClientInterfaceManager {
                             self.screen = State::ListEdit(list_id);
                             return;
                         }
-                        match self.client.send_item_storage_request(item.name, amount as u64, item.acquired, list_id) {
+                        match self.client.send_item_storage_request(
+                            item.name,
+                            amount as u64,
+                            item.acquired,
+                            list_id,
+                        ) {
                             Ok(_) => {
                                 self.screen = State::ListEdit(list_id);
                                 return;
@@ -160,7 +215,7 @@ impl ClientInterfaceManager {
                                 self.screen = State::ListEdit(list_id);
                                 return;
                             }
-                        } 
+                        }
                     }
                     println!("Invalid input: {}", other);
                 }
@@ -180,7 +235,12 @@ impl ClientInterfaceManager {
             "a" => {
                 let item = Self::build_item();
 
-                match self.client.send_item_storage_request(item.name, item.amount, item.acquired, list_id) {
+                match self.client.send_item_storage_request(
+                    item.name,
+                    item.amount,
+                    item.acquired,
+                    list_id,
+                ) {
                     Ok(_) => {
                         self.screen = State::ListEdit(list_id);
                         return;
@@ -198,7 +258,7 @@ impl ClientInterfaceManager {
                 println!("Unknown command: {}", other); //safeguard
             }
         }
-}
+    }
 
     fn handle_list_edit(&mut self, input: String, items: &Vec<ItemInterface>, list_id: Uuid) {
         match input.as_str() {
@@ -211,7 +271,12 @@ impl ClientInterfaceManager {
             "a" => {
                 let item = Self::build_item();
 
-                match self.client.send_item_storage_request(item.name, item.amount, item.acquired, list_id) {
+                match self.client.send_item_storage_request(
+                    item.name,
+                    item.amount,
+                    item.acquired,
+                    list_id,
+                ) {
                     Ok(_) => {
                         self.screen = State::ListEdit(list_id);
                         return;
@@ -231,8 +296,8 @@ impl ClientInterfaceManager {
             other => {
                 if let Ok(selection) = other.parse::<usize>() {
                     let index = selection.checked_sub(1);
-                     
-                    if let Some(idx) = index { 
+
+                    if let Some(idx) = index {
                         if idx < items.len() {
                             let chosen_item = &items[idx];
                             self.screen = State::ItemEdit(list_id, chosen_item.clone());
@@ -255,6 +320,9 @@ impl ClientInterfaceManager {
             }
             "a" => {
                 self.screen = State::ListCreate(Uuid::new_v4());
+            }
+            "s" => {
+                self.screen = State::Share;
             }
             other => {
                 if let Ok(selection) = other.parse::<usize>() {
@@ -287,8 +355,12 @@ impl ClientInterfaceManager {
             } else {
                 println!("☐");
             }
-            i+=1;
-            items.push(ItemInterface {name: item_name, amount: item.0, acquired: item.1});
+            i += 1;
+            items.push(ItemInterface {
+                name: item_name,
+                amount: item.0,
+                acquired: item.1,
+            });
         }
 
         items
@@ -369,6 +441,7 @@ impl ClientInterfaceManager {
                         return true;
                     }
                 }
+                InputRule::AcceptAll => return true,
             }
         }
 
@@ -380,22 +453,31 @@ impl ClientInterfaceManager {
         print!("> ");
         io::stdout().flush().unwrap();
         let mut name = String::new();
-        Self::read_validated_input(&mut name, &[
-            InputRule::Custom(Box::new(|s: &str | {
+        Self::read_validated_input(
+            &mut name,
+            &[InputRule::Custom(Box::new(|s: &str| {
                 s.chars().all(|c| c.is_ascii_alphabetic())
-            }))
-        ]);
+            }))],
+        );
         let mut amount_string = String::new();
         println!("Enter item amount: ");
         print!("> ");
         io::stdout().flush().unwrap();
-        Self::read_validated_input(&mut amount_string, &[
-            InputRule::AcceptNumberRange { low: 1, high: UPPER_ITEM_COUNT_LIMIT }
-        ]);
+        Self::read_validated_input(
+            &mut amount_string,
+            &[InputRule::AcceptNumberRange {
+                low: 1,
+                high: UPPER_ITEM_COUNT_LIMIT,
+            }],
+        );
 
         //WARNING: this should be fine because of the input sanizitation and the limit, but be careful.
         let amount = amount_string.parse::<u64>().expect("Int parsing error.");
 
-        ItemInterface { name, amount, acquired: false} 
+        ItemInterface {
+            name,
+            amount,
+            acquired: false,
+        }
     }
 }

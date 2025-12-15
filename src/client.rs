@@ -1,15 +1,15 @@
-use uuid::Uuid;
-use zmq::{Context, Error as zmqErr, SocketType, Socket};
-use crate::storage::{ClientStorage};
-use crate::crdt::{Mergeable, ShoppingList};
+use crate::crdt::{AWORMap, Mergeable, ShoppingList};
 use crate::message::Msg;
-use serde_json;
+use crate::storage::ClientStorage;
 use anyhow::Result;
+use serde_json;
 use std::collections::HashMap;
+use uuid::Uuid;
+use zmq::{Context, Error as zmqErr, Socket, SocketType};
 
 pub struct ShoppingListInterface {
     pub list_id: Uuid,
-    pub items: HashMap<String, (u64, bool)> // <name, (amount, acquired)>
+    pub items: HashMap<String, (u64, bool)>, // <name, (amount, acquired)>
 }
 
 impl ShoppingListInterface {
@@ -19,7 +19,7 @@ impl ShoppingListInterface {
         for (k, v) in map.items.iter() {
             let name = k.clone();
             let amount = v.amount.value_total() as u64;
-            let acquired: bool = v.acquired.val != 0; 
+            let acquired: bool = v.acquired.val != 0;
             items.insert(name, (amount, acquired));
         }
         Self {
@@ -58,8 +58,8 @@ impl Client {
         let storage_handler = ClientStorage::new(username)?;
         let context = Context::new();
         let socket = context.socket(SocketType::REQ)?;
-        socket.set_rcvtimeo(100)?; 
-        socket.set_linger(0)?;    
+        socket.set_rcvtimeo(100)?;
+        socket.set_linger(0)?;
         socket.connect("tcp://127.0.0.1:5555")?;
         Ok(Self {
             id: storage_handler.client_id,
@@ -86,19 +86,17 @@ impl Client {
                 }
                 Ok(Some(list_interface_vec))
             }
-            None => {
-                Ok(None)
-            }
+            None => Ok(None),
         }
     }
 
-    fn fetch_list(&self, list: &ShoppingList) -> Result<Option<ShoppingList>> {
+    pub fn fetch_list(&self, list: &ShoppingList) -> Result<Option<ShoppingList>> {
         let msg = Msg::GetList { list: list.clone() };
         let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
 
         if let Err(e) = self.socket.send(payload, zmq::DONTWAIT) {
             self.reset_socket()?;
-            return Ok(None)
+            return Ok(None);
         }
 
         let reply_res = self.socket.recv_msg(0);
@@ -107,20 +105,24 @@ impl Client {
                 let response: Msg = serde_json::from_slice(&reply)?;
 
                 match response {
-                    Msg::AckList { list, .. } => {
+                    Msg::AckList { list: l, .. } => {
                         println!("Received AckList from server");
-                        Ok(Some(list))
-                    },
+                        let mut merged = list.clone();
+
+                        merged.list.merge(&l.list);
+
+                        Ok(Some(merged))
+                    }
                     Msg::Nack { .. } => {
                         println!("Received Nack from server");
                         Ok(None)
-                    },
+                    }
                     _ => anyhow::bail!("Unexpected response from server"),
                 }
             }
             Err(zmq::Error::EAGAIN) => {
                 self.reset_socket()?;
-                return Ok(None) // server unavailable or slow
+                return Ok(None); // server unavailable or slow
             }
             Err(e) => return Err(e.into()),
         }
@@ -139,7 +141,7 @@ impl Client {
             Ok(reply) => {
                 let response: Msg = serde_json::from_slice(&reply)?;
                 match response {
-                    Msg::AckList { .. } => {
+                    Msg::AckList { request_id, list } => {
                         println!("Server response: AckList");
                     }
                     Msg::Nack { .. } => {
@@ -180,12 +182,41 @@ impl Client {
         Ok(list_interface)
     }
 
-    pub fn send_item_storage_request(&mut self, item_name: String, quantity: u64, acquired: bool, shoppinglist_id: Uuid) -> Result<()> {
-        self.storage_handler.handle_item_storage_request(item_name, quantity, acquired, shoppinglist_id)?;
+    pub fn send_item_storage_request(
+        &mut self,
+        item_name: String,
+        quantity: u64,
+        acquired: bool,
+        shoppinglist_id: Uuid,
+    ) -> Result<()> {
+        self.storage_handler.handle_item_storage_request(
+            item_name,
+            quantity,
+            acquired,
+            shoppinglist_id,
+        )?;
 
         let updated_list = self.storage_handler.read_shopping_list(shoppinglist_id)?;
         self.send_list(&updated_list)?;
         Ok(())
+    }
+
+    pub fn send_share(&mut self, shoppinglist_id: Uuid) -> Result<ShoppingListInterface> {
+        let shopping_list: ShoppingList = ShoppingList {
+            id: shoppinglist_id,
+            list: AWORMap::new(),
+        };
+        let remote_list = self.fetch_list(&shopping_list)?;
+
+        let merged_list = if let Some(remote) = remote_list {
+            let mut merged = shopping_list;
+            merged.list.merge(&remote.list);
+            merged
+        } else {
+            return Err(anyhow::anyhow!("Shopping list not found in remote"));
+        };
+
+        Ok(ShoppingListInterface::from_crdt(&merged_list))
     }
 
     pub fn connect(&self) -> Result<(), zmqErr> {
@@ -201,7 +232,9 @@ impl Client {
         };
 
         // Send a PutList message with the new shopping list
-        let msg = Msg::GetList { list: shopping_list };
+        let msg = Msg::GetList {
+            list: shopping_list,
+        };
         let payload = serde_json::to_vec(&msg).expect("Failed to serialize Msg");
 
         requester.send(payload, 0)?;
