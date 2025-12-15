@@ -1,7 +1,7 @@
 use crate::crdt::{AWORMap, GCounter, Item, LWWReg, Mergeable, PNCounter, ShoppingList};
 use crate::hash_ring::HashRing;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, Result as sqlResult, Row, ToSql, params};
+use rusqlite::{Connection, Result as sqlResult, Row, ToSql, params, OptionalExtension};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -146,7 +146,7 @@ impl ClientStorage {
             Some(stored_item_row) => {
                 let mut stored_item = self.build_item(&stored_item_row)?;
 
-                let current_quantity = stored_item.amount.value_local();
+                let current_quantity = stored_item.amount.value_total();
                 let delta = quantity as i64 - current_quantity;
 
                 let mut local_updated_item = stored_item.clone();
@@ -465,44 +465,58 @@ impl ClientStorage {
         Ok(())
     }
 
-    fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
+    pub fn write_shopping_list(&mut self, shopping_list: &ShoppingList) -> Result<()> {
         let shopping_list_id = shopping_list.id.to_string();
         let map = &shopping_list.list;
 
         let tx = self.db_conn.transaction()?;
 
         for (name, item) in &map.items {
-            // Insert positive gcounter
-            let p_id = {
-                tx.execute("INSERT INTO gcounter DEFAULT VALUES", ())?;
+            // Check if item exists
+            let row: Option<(i64, i64)> = tx.query_row(
+                "SELECT p_gcounter_id, n_gcounter_id FROM awormap_items WHERE shopping_list_id = ?1 AND item_name = ?2",
+                (&shopping_list_id, name),
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
 
-                tx.last_insert_rowid()
+            let (p_id, n_id) = if let Some((p, n)) = row {
+                // reuse existing gcounters
+                (p, n)
+            } else {
+                // Insert new positive gcounter
+                let p_id = {
+                    tx.execute("INSERT INTO gcounter DEFAULT VALUES", ())?;
+                    tx.last_insert_rowid()
+                };
+
+                // Insert new negative gcounter
+                let n_id = {
+                    tx.execute("INSERT INTO gcounter DEFAULT VALUES", ())?;
+                    tx.last_insert_rowid()
+                };
+
+                (p_id, n_id)
             };
 
-            // Insert negative gcounter
-            let n_id = {
-                tx.execute("INSERT INTO gcounter DEFAULT VALUES", ())?;
-
-                tx.last_insert_rowid()
-            };
-
-            // Insert positive counter actor counts
+            // Update positive counter actor values
             for (actor, count) in &item.amount.p.counter {
                 tx.execute(
-                    "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)",
+                    "INSERT OR REPLACE INTO gcounter_actor_values (gcounter_id, actor_id, value)
+                     VALUES (?1, ?2, ?3)",
                     (&p_id, &actor.to_string(), count),
                 )?;
             }
 
-            // Insert negative counter actor counts
+            // Update negative counter actor values
             for (actor, count) in &item.amount.n.counter {
                 tx.execute(
-                    "INSERT INTO gcounter_actor_values (gcounter_id, actor_id, value) VALUES (?1, ?2 ,?3)", 
+                    "INSERT OR REPLACE INTO gcounter_actor_values (gcounter_id, actor_id, value)
+                     VALUES (?1, ?2, ?3)",
                     (&n_id, &actor.to_string(), count),
                 )?;
             }
 
-            // Insert item
+            // Insert or update item
             tx.execute(
                 "INSERT INTO awormap_items (
                     shopping_list_id,
@@ -512,7 +526,14 @@ impl ClientStorage {
                     acquired_actor,
                     p_gcounter_id,
                     n_gcounter_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(shopping_list_id, item_name)
+                DO UPDATE SET
+                    acquired_val = excluded.acquired_val,
+                    acquired_clock = excluded.acquired_clock,
+                    acquired_actor = excluded.acquired_actor,
+                    p_gcounter_id = excluded.p_gcounter_id,
+                    n_gcounter_id = excluded.n_gcounter_id;",
                 (
                     &shopping_list_id,
                     name,
@@ -526,7 +547,6 @@ impl ClientStorage {
         }
 
         tx.commit()?;
-
         Ok(())
     }
 }

@@ -165,13 +165,14 @@ impl Client {
         Ok(())
     }
 
-    pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
+    pub fn retrieve_list(&mut self, list_id: Uuid) -> Result<ShoppingListInterface> {
         let local_list = self.storage_handler.read_shopping_list(list_id)?;
         let remote_list = self.fetch_list(&local_list)?;
 
         let merged_list = if let Some(remote) = remote_list {
             let mut merged = local_list;
             merged.list.merge(&remote.list);
+            let _ = self.storage_handler.write_shopping_list(&merged);
             merged
         } else {
             local_list
@@ -199,24 +200,6 @@ impl Client {
         let updated_list = self.storage_handler.read_shopping_list(shoppinglist_id)?;
         self.send_list(&updated_list)?;
         Ok(())
-    }
-
-    pub fn send_share(&mut self, shoppinglist_id: Uuid) -> Result<ShoppingListInterface> {
-        let shopping_list: ShoppingList = ShoppingList {
-            id: shoppinglist_id,
-            list: AWORMap::new(),
-        };
-        let remote_list = self.fetch_list(&shopping_list)?;
-
-        let merged_list = if let Some(remote) = remote_list {
-            let mut merged = shopping_list;
-            merged.list.merge(&remote.list);
-            merged
-        } else {
-            return Err(anyhow::anyhow!("Shopping list not found in remote"));
-        };
-
-        Ok(ShoppingListInterface::from_crdt(&merged_list))
     }
 
     pub fn connect(&self) -> Result<(), zmqErr> {
