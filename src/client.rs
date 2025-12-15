@@ -163,13 +163,14 @@ impl Client {
         Ok(())
     }
 
-    pub fn retrieve_list(&self, list_id: Uuid) -> Result<ShoppingListInterface> {
+    pub fn retrieve_list(&mut self, list_id: Uuid) -> Result<ShoppingListInterface> {
         let local_list = self.storage_handler.read_shopping_list(list_id)?;
         let remote_list = self.fetch_list(&local_list)?;
 
         let merged_list = if let Some(remote) = remote_list {
             let mut merged = local_list;
             merged.list.merge(&remote.list);
+            let _ = self.storage_handler.write_shopping_list(&merged);
             merged
         } else {
             local_list

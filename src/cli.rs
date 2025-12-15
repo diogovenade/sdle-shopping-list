@@ -43,7 +43,7 @@ impl ClientInterfaceManager {
                 print!("{}", CLEAR_SEQUENCE);
                 println!("Logged in as client: {}", client_id.to_string());
                 let list_vec = self.print_lists();
-                println!("Commands: q - quit; <nr> - open list number <nr>; a - add new list;");
+                println!("Commands: q - quit; <nr> - open list number <nr>; c - create new list; a - add new list (by uuid)");
                 print!("> ");
                 io::stdout().flush().unwrap();
 
@@ -51,7 +51,7 @@ impl ClientInterfaceManager {
                 Self::read_validated_input(
                     &mut input,
                     &[
-                        InputRule::AcceptStrings(&["a", "q"]),
+                        InputRule::AcceptStrings(&["a", "q", "c"]),
                         InputRule::AcceptNumberRange {
                             low: 1,
                             high: list_vec.len(),
@@ -80,12 +80,12 @@ impl ClientInterfaceManager {
                     print!("{}", CLEAR_SEQUENCE);
                     let items = Self::print_and_process_list_items(list);
 
-                    println!("\nCommands: q - quit; b- back to menu; <nr> - edit item number <nr>; a - add new item;");
+                    println!("\nCommands: q - quit; b- back to menu; <nr> - edit item number <nr>; a - add new item; r - refresh;");
                     print!("> ");
                     io::stdout().flush().unwrap();
 
                     Self::read_validated_input(&mut input, &[
-                        InputRule::AcceptStrings(&["q", "b", "a"]),
+                        InputRule::AcceptStrings(&["q", "b", "a", "r"]),
                         InputRule::AcceptNumberRange { low: 1, high: items.len() },
                     ]);
                     self.handle_list_edit(input, &items, list_id);
@@ -208,6 +208,10 @@ impl ClientInterfaceManager {
             "b" => {
                 self.screen = State::MainMenu;
             }
+            "r" =>  {
+                self.screen = State::ListEdit(list_id);
+                return;
+            }
             "a" => {
                 let item = Self::build_item();
 
@@ -253,8 +257,23 @@ impl ClientInterfaceManager {
             "q" => {
                 self.screen = State::Exit;
             }
-            "a" => {
+            "c" => {
                 self.screen = State::ListCreate(Uuid::new_v4());
+            }
+            "a" => {
+                print!("> ");
+                io::stdout().flush().unwrap();
+                let mut id = String::new();
+                Self::read_validated_input(&mut id, &[
+                    InputRule::Custom(Box::new(|input| {
+                        Uuid::parse_str(input).is_ok()
+                    }))
+                ]);
+
+                let uuid = Uuid::parse_str(&id).unwrap();
+
+                self.screen = State::ListEdit(uuid);
+                return;
             }
             other => {
                 if let Ok(selection) = other.parse::<usize>() {
